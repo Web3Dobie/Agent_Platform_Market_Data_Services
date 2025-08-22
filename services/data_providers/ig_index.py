@@ -320,7 +320,7 @@ class IGIndexProvider:
                 return await self.authenticate()
             
             # Try to fetch a simple market (SPY)
-            test_data = await self.get_price("SPY")
+            test_data = await self.get_price("EURUSD=X")
             return test_data is not None
             
         except Exception as e:
