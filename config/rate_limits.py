@@ -1,61 +1,44 @@
-# services/aggregator.py (Complete with Yahoo scaffolding)
-"""
-Complete market data aggregator with Yahoo Finance scaffolding
-Ready to activate Yahoo over the weekend when rate limits reset
-"""
-
+# services/data_aggregator.py (Updated version)
 import asyncio
 import logging
 from typing import List, Optional, Dict
 from datetime import datetime
 
-from .data_providers.binance import BinanceProvider
-from .data_providers.mexc import MEXCProvider  
-from .data_providers.ig_index import IGIndexProvider
-from .data_providers.yahoo_finance_provider import YahooFinanceProvider
+from .data_providers.binance_provider import BinanceProvider
+from .data_providers.mexc_provider import MexcProvider  
+from .data_providers.ig_provider import IGProvider
+from .data_providers.enhanced_yahoo_finance import EnhancedYahooFinanceProvider
 from app.models import PriceData, AssetType
 
 logger = logging.getLogger(__name__)
 
-class MarketDataAggregator:
+class DataAggregator:
     """
-    Complete market data aggregator with all providers
-    Yahoo Finance ready to activate when rate limits reset
+    Enhanced data aggregator with improved Yahoo Finance integration
     """
     
-    def __init__(self, enable_yahoo_api: bool = False):
-        # Initialize all providers
+    def __init__(self):
+        # Initialize providers
         self.binance = BinanceProvider()
-        self.mexc = MEXCProvider()
-        self.ig = IGIndexProvider()
-        self.yahoo = YahooFinanceProvider(enable_api_calls=enable_yahoo_api)
+        self.mexc = MexcProvider()
+        self.ig = IGProvider()
+        self.yahoo = EnhancedYahooFinanceProvider()  # Enhanced provider
         
         # Provider priority for different asset types
         self.provider_priority = {
             AssetType.CRYPTO: ['binance', 'mexc', 'yahoo'],
             AssetType.FOREX: ['ig', 'yahoo'],
-            AssetType.EQUITY: ['yahoo', 'ig'],  # Yahoo first when available
-            AssetType.INDEX: ['yahoo', 'ig'],   # Yahoo excellent for indices
+            AssetType.EQUITY: ['yahoo', 'ig'],  # Yahoo first for equities
+            AssetType.INDEX: ['yahoo', 'ig'],
             AssetType.COMMODITY: ['ig', 'yahoo']
         }
         
-        # Yahoo-specific symbol patterns (when it becomes available)
-        self.yahoo_preferred_symbols = {
-            # Treasury yields (your working use case)
-            '^TNX', '^IRX', '^TYX',
-            # US indices
-            '^GSPC', '^IXIC', '^DJI', '^RUT',
-            # Individual equities
-            'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA', 'AMZN', 'META'
-        }
-        
-        yahoo_status = "ENABLED" if enable_yahoo_api else "SCAFFOLDED"
-        logger.info(f"📊 Market Data Aggregator initialized - Yahoo: {yahoo_status}")
+        logger.info("📊 Enhanced Data Aggregator initialized with batch processing")
     
     async def get_price(self, symbol: str) -> Optional[PriceData]:
-        """Get single price with intelligent provider routing"""
+        """Get single price with enhanced provider selection"""
         asset_type = self._detect_asset_type(symbol)
-        providers = self._get_providers_for_symbol(symbol, asset_type)
+        providers = self.provider_priority.get(asset_type, ['yahoo'])
         
         logger.debug(f"💰 Getting price for {symbol} (type: {asset_type}) - providers: {providers}")
         
@@ -77,8 +60,8 @@ class MarketDataAggregator:
     
     async def get_bulk_prices(self, symbols: List[str]) -> List[Optional[PriceData]]:
         """
-        Intelligent bulk price fetching with provider optimization
-        Routes symbols to best providers and uses bulk endpoints where possible
+        Enhanced bulk price fetching with smart provider routing
+        Key improvement: Use batch processing for Yahoo Finance
         """
         if not symbols:
             return []
@@ -101,7 +84,7 @@ class MarketDataAggregator:
             try:
                 provider = getattr(self, provider_name)
                 
-                # Use bulk method if available
+                # Use bulk method if available (Yahoo has enhanced bulk processing)
                 if hasattr(provider, 'get_bulk_prices'):
                     provider_results = await provider.get_bulk_prices(provider_symbols)
                     
@@ -109,7 +92,7 @@ class MarketDataAggregator:
                     for symbol, result in zip(provider_symbols, provider_results):
                         results[symbol] = result
                 else:
-                    # Fallback to individual requests
+                    # Fallback to individual requests for other providers
                     for symbol in provider_symbols:
                         result = await provider.get_price(symbol)
                         results[symbol] = result
@@ -135,19 +118,10 @@ class MarketDataAggregator:
         
         return final_results
     
-    def _get_providers_for_symbol(self, symbol: str, asset_type: AssetType) -> List[str]:
-        """Get optimal provider list for a specific symbol"""
-        # Check if this is a Yahoo-preferred symbol
-        if symbol in self.yahoo_preferred_symbols and self.yahoo.enable_api_calls:
-            return ['yahoo', 'ig']  # Yahoo first, IG fallback
-        
-        # Use standard asset type routing
-        return self.provider_priority.get(asset_type, ['ig', 'yahoo'])
-    
     def _group_symbols_by_provider(self, symbols: List[str]) -> Dict[str, List[str]]:
         """
         Smart symbol grouping by optimal provider
-        Routes symbols to providers that handle them best
+        This is key for efficient batch processing
         """
         groups = {
             'binance': [],
@@ -158,20 +132,8 @@ class MarketDataAggregator:
         
         for symbol in symbols:
             asset_type = self._detect_asset_type(symbol)
-            
-            # Special routing for Yahoo-preferred symbols (when available)
-            if symbol in self.yahoo_preferred_symbols and self.yahoo.enable_api_calls:
-                groups['yahoo'].append(symbol)
-            elif asset_type == AssetType.CRYPTO:
-                # Crypto goes to dedicated exchanges
-                if 'USDT' in symbol.upper():
-                    groups['binance'].append(symbol)  # Binance excellent for USDT pairs
-                else:
-                    groups['mexc'].append(symbol)     # MEXC good for variety
-            else:
-                # Non-crypto goes to traditional providers
-                primary_provider = self.provider_priority.get(asset_type, ['ig'])[0]
-                groups[primary_provider].append(symbol)
+            primary_provider = self.provider_priority.get(asset_type, ['yahoo'])[0]
+            groups[primary_provider].append(symbol)
         
         # Log grouping decisions
         for provider, provider_symbols in groups.items():
@@ -184,13 +146,10 @@ class MarketDataAggregator:
         """Retry failed symbols with alternative providers"""
         for symbol in failed_symbols:
             asset_type = self._detect_asset_type(symbol)
-            providers = self.provider_priority.get(asset_type, ['ig', 'yahoo'])
+            providers = self.provider_priority.get(asset_type, ['yahoo'])
             
             # Try alternative providers
-            for provider_name in providers:
-                if results[symbol] is not None:  # Already succeeded
-                    break
-                    
+            for provider_name in providers[1:]:  # Skip primary provider
                 try:
                     provider = getattr(self, provider_name)
                     result = await provider.get_price(symbol)
@@ -226,27 +185,8 @@ class MarketDataAggregator:
         
         # Default to equity
         return AssetType.EQUITY
-    
-    def enable_yahoo_finance(self):
-        """Enable Yahoo Finance API calls (weekend activation)"""
-        self.yahoo.enable_api()
-        logger.info("🚀 Yahoo Finance activated in aggregator")
-    
-    def disable_yahoo_finance(self):
-        """Disable Yahoo Finance API calls (safety)"""
-        self.yahoo.disable_api()
-        logger.info("🛑 Yahoo Finance disabled in aggregator")
-    
-    def get_provider_status(self) -> Dict[str, str]:
-        """Get status of all providers"""
-        return {
-            'binance': 'active',
-            'mexc': 'active', 
-            'ig': 'active',
-            'yahoo': 'active' if self.yahoo.enable_api_calls else 'scaffolded'
-        }
 
 # Dependency injection function
-async def get_aggregator(enable_yahoo: bool = False) -> MarketDataAggregator:
-    """Get market data aggregator instance"""
-    return MarketDataAggregator(enable_yahoo_api=enable_yahoo)
+async def get_aggregator() -> DataAggregator:
+    """Get data aggregator instance"""
+    return DataAggregator()
