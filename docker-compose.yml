@@ -13,6 +13,8 @@ services:
       - IG_API_KEY=${IG_API_KEY}
       - IG_ACC_TYPE=${IG_ACC_TYPE:-DEMO}
       - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
     depends_on:
       - redis
     restart: unless-stopped

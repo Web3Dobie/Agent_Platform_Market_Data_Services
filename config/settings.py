@@ -1,3 +1,4 @@
+# config/settings.py
 from pydantic_settings import BaseSettings
 from typing import Optional
 
@@ -19,6 +20,11 @@ class Settings(BaseSettings):
     
     # Other API Keys
     finnhub_api_key: Optional[str] = None
+    
+    # Telegram Configuration
+    tg_bot_token: Optional[str] = None
+    tg_chat_id: Optional[str] = None
+    telegram_enabled: bool = True  # Can be disabled via env var
     
     # Cache TTL (seconds)
     crypto_cache_ttl: int = 60      # 1 minute for crypto

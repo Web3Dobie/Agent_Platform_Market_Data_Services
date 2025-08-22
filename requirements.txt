@@ -12,3 +12,4 @@ munch
 requests-oauthlib
 lightstreamer-client-lib
 pandas
+requests

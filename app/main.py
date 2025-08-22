@@ -1,12 +1,23 @@
-from fastapi import FastAPI, Depends
+# app/main.py
+"""
+Production Market Data Service with enhanced but safe Telegram integration
+"""
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.models import HealthResponse
 from app.routers import prices
 from services.aggregator import DataAggregator
+from services.telegram_notifier import (
+    get_notifier, 
+    notify_startup, 
+    notify_error, 
+    notify_health_issue
+)
 from config.settings import settings
 from datetime import datetime
 import logging
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -23,18 +34,97 @@ aggregator = DataAggregator()
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Starting Market Data Service...")
-    await aggregator.initialize()
-    logger.info("✅ Market Data Service initialized")
+    
+    try:
+        # Initialize aggregator
+        await aggregator.initialize()
+        logger.info("✅ Market Data Service initialized")
+        
+        # Get provider list with improved error handling
+        providers = []
+        try:
+            if hasattr(aggregator, 'providers') and aggregator.providers:
+                providers = list(aggregator.providers.keys())
+            else:
+                # Fallback provider list
+                providers = ['binance', 'yahoo', 'ig_index', 'mexc']
+                logger.warning("⚠️ Using fallback provider list")
+        except Exception as e:
+            logger.error(f"❌ Error getting provider list: {e}")
+            providers = ['unknown']
+        
+        # Send enhanced startup notification
+        startup_success = notify_startup(settings.host, settings.port, providers)
+        if startup_success:
+            logger.info(f"📊 Enhanced startup notification sent successfully")
+        else:
+            logger.warning(f"⚠️ Startup notification failed - continuing anyway")
+        
+        # Start background heartbeat task
+        heartbeat_task = asyncio.create_task(heartbeat_background_task())
+        logger.info("💓 Heartbeat task started")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start Market Data Service: {e}")
+        notify_error("Service Startup", str(e))
+        raise
     
     yield
     
     # Shutdown
     logger.info("🛑 Shutting down Market Data Service...")
+    try:
+        heartbeat_task.cancel()
+        await heartbeat_task
+    except:
+        pass
+
+async def heartbeat_background_task():
+    """Background heartbeat task with enhanced monitoring"""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # 30 minutes
+            
+            # Check system health
+            services = await aggregator.health_check()
+            healthy_count = sum(1 for status in services.values() if status)
+            total_count = len(services)
+            
+            # Get enhanced stats
+            notifier = get_notifier()
+            stats = notifier.get_stats()
+            
+            # Send appropriate notification based on health
+            if healthy_count == total_count:
+                # All healthy - send heartbeat
+                heartbeat_msg = f"💓 *System Heartbeat*\n📊 All {total_count} providers healthy\n🔢 Requests: {stats['total_requests']} \\| Success: {stats['success_rate']}"
+                notifier.send_message(heartbeat_msg)
+                logger.info("💓 Heartbeat sent - all systems healthy")
+            else:
+                # Some issues - send health warning
+                failed_providers = [k for k, v in services.items() if not v]
+                notify_health_issue(
+                    "Heartbeat Check", 
+                    f"Providers down: {', '.join(failed_providers)} ({total_count-healthy_count}/{total_count})"
+                )
+                logger.warning(f"⚠️ Heartbeat detected issues: {len(failed_providers)} providers down")
+            
+        except asyncio.CancelledError:
+            logger.info("💓 Heartbeat task cancelled")
+            break
+            
+        except Exception as e:
+            logger.error(f"❌ Heartbeat task error: {e}")
+            try:
+                notify_error("Heartbeat Task", str(e))
+            except:
+                pass  # Don't let notification errors break heartbeat
+            # Continue the loop
 
 app = FastAPI(
     title="Market Data Service",
     version="1.0.0",
-    description="High-performance market data API with intelligent caching",
+    description="High-performance market data API with enhanced Telegram monitoring",
     lifespan=lifespan
 )
 
@@ -53,37 +143,181 @@ async def get_aggregator() -> DataAggregator:
 # Include routers
 app.include_router(prices.router)    
 
-# CRITICAL: Override the dependency AFTER including the router
+# Override the dependency AFTER including the router
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Service health check"""
-    services = await aggregator.health_check()
-    
-    # Determine overall status
-    status = "healthy" if all(services.values()) else "degraded"
-    
-    return HealthResponse(
-        status=status,
-        timestamp=datetime.utcnow(),
-        services=services
-    )
+    """Enhanced service health check"""
+    try:
+        services = await aggregator.health_check()
+        healthy_count = sum(1 for status in services.values() if status)
+        total_count = len(services)
+        
+        # Determine status
+        if healthy_count == total_count:
+            status = "healthy"
+        elif healthy_count > 0:
+            status = "degraded"
+        else:
+            status = "unhealthy"
+        
+        # Notify on significant issues
+        if status == "degraded":
+            failed_providers = [k for k, v in services.items() if not v]
+            notify_health_issue(
+                "Service Degraded", 
+                f"Failed: {', '.join(failed_providers)} ({total_count-healthy_count}/{total_count})"
+            )
+        elif status == "unhealthy":
+            notify_health_issue("Service Unhealthy", "All providers failed")
+        
+        return HealthResponse(
+            status=status,
+            timestamp=datetime.utcnow(),
+            services=services
+        )
+        
+    except Exception as e:
+        notify_error("Health Check", str(e))
+        raise HTTPException(status_code=500, detail="Health check failed")
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    """Root endpoint with enhanced service information"""
+    notifier = get_notifier()
+    stats = notifier.get_stats()
+    
     return {
         "service": "Market Data Service",
         "version": "1.0.0",
         "status": "running",
+        "telegram": {
+            "enabled": stats["enabled"],
+            "version": stats["version"],
+            "total_requests": stats["total_requests"],
+            "failed_requests": stats["failed_requests"],
+            "success_rate": stats["success_rate"],
+            "features": stats["features"]
+        },
         "endpoints": {
             "health": "/health",
             "single_price": "/prices/{symbol}",
-            "bulk_prices": "/prices/bulk",
-            "major_crypto": "/prices/crypto/major"
+            "bulk_prices": "/prices/bulk", 
+            "major_crypto": "/prices/crypto/major",
+            "telegram_status": "/telegram/status",
+            "telegram_test": "/telegram/test"
         }
     }
+
+@app.get("/telegram/status")
+async def telegram_status():
+    """Get enhanced Telegram status"""
+    notifier = get_notifier()
+    stats = notifier.get_stats()
+    
+    return {
+        "telegram_notifier": stats,
+        "configuration": {
+            "bot_token_configured": bool(notify_startup.__module__),
+            "chat_id_configured": stats["enabled"]
+        },
+        "capabilities": {
+            "markdown_v2_support": True,
+            "automatic_fallback": True,
+            "safe_character_escaping": True,
+            "enhanced_formatting": True
+        }
+    }
+
+@app.post("/telegram/test")
+async def test_telegram(message: str = "Enhanced test message with special chars: *bold* _italic_ `code` & symbols!"):
+    """Test enhanced Telegram functionality"""
+    notifier = get_notifier()
+    
+    if not notifier.enabled:
+        return {
+            "success": False,
+            "message": "Telegram not configured",
+            "help": "Set TG_BOT_TOKEN and TG_CHAT_ID environment variables"
+        }
+    
+    try:
+        # Build enhanced test message
+        from services.telegram_notifier import build_safe_message, NotificationLevel
+        
+        test_message = build_safe_message(
+            emoji="🧪",
+            title="Enhanced Test Message", 
+            body=message,
+            fields={
+                "Test Type": "API Test",
+                "Special Characters": "Testing: *bold* _italic_ `code` [link] & more!",
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        )
+        
+        success = notifier.send_message(test_message, NotificationLevel.INFO)
+        
+        return {
+            "success": success,
+            "message": "Enhanced test sent" if success else "Test failed",
+            "features_used": ["markdown_v2", "safe_escaping", "structured_message"],
+            "stats": notifier.get_stats()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Test error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Test failed with exception"
+        }
+
+@app.post("/telegram/heartbeat")
+async def manual_heartbeat():
+    """Trigger manual heartbeat"""
+    try:
+        # Get system status
+        services = await aggregator.health_check()
+        healthy_count = sum(1 for status in services.values() if status)
+        total_count = len(services)
+        
+        # Get stats
+        notifier = get_notifier()
+        stats = notifier.get_stats()
+        
+        # Send heartbeat
+        if healthy_count == total_count:
+            heartbeat_msg = f"💓 *Manual Heartbeat*\n📊 All {total_count} providers healthy\n🔢 Requests: {stats['total_requests']} \\| Success: {stats['success_rate']}"
+            success = notifier.send_message(heartbeat_msg)
+            
+            return {
+                "success": success,
+                "status": "healthy",
+                "message": "Manual heartbeat sent",
+                "provider_stats": f"{healthy_count}/{total_count} healthy"
+            }
+        else:
+            failed_providers = [k for k, v in services.items() if not v]
+            notify_health_issue(
+                "Manual Heartbeat", 
+                f"Failed: {', '.join(failed_providers)}"
+            )
+            
+            return {
+                "success": True,
+                "status": "degraded", 
+                "failed_providers": failed_providers,
+                "provider_stats": f"{healthy_count}/{total_count} healthy"
+            }
+            
+    except Exception as e:
+        notify_error("Manual Heartbeat", str(e))
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn
