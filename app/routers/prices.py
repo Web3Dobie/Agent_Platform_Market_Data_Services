@@ -8,10 +8,12 @@ from datetime import datetime
 from app.models import PriceData, BulkPriceRequest, BulkPriceResponse
 from services.aggregator import DataAggregator
 from services.telegram_notifier import notify_error, get_notifier
+from services.symbol_normalizer import DynamicSymbolNormalizer
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/prices", tags=["prices"])
+normalizer = DynamicSymbolNormalizer()
 
 # Dependency injection
 def get_aggregator() -> DataAggregator:
@@ -235,3 +237,43 @@ async def test_symbol_request(
             "success": False,
             "error": error_msg
         }
+
+@router.get("/{symbol}")
+async def get_price(symbol: str, aggregator: DataAggregator = Depends(get_aggregator)):
+    """Get price for a symbol with automatic normalization"""
+    try:
+        # 🆕 Normalize the symbol first
+        normalized = normalizer.normalize_symbol(symbol)
+        
+        logger.info(f"📊 Price request: {symbol} -> {normalized.clean_symbol} ({normalized.asset_type})")
+        
+        # Use the clean symbol for the existing logic
+        price_data = await aggregator.get_price(normalized.clean_symbol)
+        
+        if price_data:
+            # Add normalization info to response
+            response_data = {
+                "symbol": normalized.clean_symbol,
+                "original_symbol": symbol,
+                "asset_type": price_data.asset_type.value,
+                "price": price_data.price,
+                "change_percent": price_data.change_percent,
+                "change_absolute": price_data.change_absolute,
+                "volume": price_data.volume,
+                "market_cap": price_data.market_cap,
+                "timestamp": price_data.timestamp,
+                "source": price_data.source,
+                # 🆕 Add normalization metadata
+                "normalization": {
+                    "ig_epic": normalized.ig_epic,
+                    "confidence": normalized.confidence,
+                    "detected_type": normalized.asset_type
+                }
+            }
+            return response_data
+        else:
+            raise HTTPException(status_code=404, detail=f"Price data not found for {symbol}")
+            
+    except Exception as e:
+        logger.error(f"Price fetch error for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

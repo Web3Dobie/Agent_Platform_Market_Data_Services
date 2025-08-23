@@ -7,6 +7,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8001:8001"
+    volumes:
+      - ./config:/app/config
     environment:
       - IG_USERNAME=${IG_USERNAME}
       - IG_PASSWORD=${IG_PASSWORD}
