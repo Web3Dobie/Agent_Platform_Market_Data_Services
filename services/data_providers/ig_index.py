@@ -1,12 +1,13 @@
 # ==============================================================================
-# IG INDEX PROVIDER - SIMPLIFIED FOR EPIC DISCOVERY
+# IG INDEX PROVIDER - DATABASE-FIRST REFACTOR
 # services/data_providers/ig_index.py
 # ==============================================================================
 
 from trading_ig import IGService
 from trading_ig.config import config
 import asyncio
-import json
+import psycopg2
+import psycopg2.extras
 import os
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -17,78 +18,92 @@ import logging
 logger = logging.getLogger(__name__)
 
 class IGIndexProvider:
-    """IG Index API with EPIC discovery and JSON storage"""
+    """IG Index API with database-first symbol management"""
     
     def __init__(self):
         self.ig_service = None
         self.authenticated = False
+        self.db_connection = None
         
-        # JSON file for EPIC mappings
-        self.json_file_path = 'config/ig_epic_mappings.json'
-        self.epic_mappings = self._load_epic_mappings()
-        
-        # All known prefixes to try
+        # All known prefixes to try for discovery
         self.prefixes = [
             'UA', 'UB', 'UC', 'UD', 'UE', 'UF', 'UG', 'UH', 'UI', 'UJ',
             'SA', 'SB', 'SC', 'SD', 'SE', 'SF', 'SG', 'SH',
             'IX', 'CS', 'CC', 'MT', 'SI'
         ]
         
-        logger.info(f"✅ IG Index provider initialized with {len(self.epic_mappings)} mappings")
+        logger.info("IG Index provider initialized with database-first approach")
     
-    def _load_epic_mappings(self) -> Dict[str, str]:
-        """Load ticker -> EPIC mappings from JSON"""
-        try:
-            with open(self.json_file_path, 'r') as f:
-                data = json.load(f)
-                # Extract just the ticker -> epic mappings
-                mappings = {}
-                for ticker, info in data.items():
-                    if ticker != '_metadata' and isinstance(info, dict):
-                        epic = info.get('epic', '')
-                        if epic:
-                            mappings[ticker.upper()] = epic
-                    elif isinstance(info, str):
-                        # Handle simple string mappings
-                        mappings[ticker.upper()] = info
-                
-                logger.info(f"📂 Loaded {len(mappings)} EPIC mappings from JSON")
-                return mappings
-        except FileNotFoundError:
-            logger.warning(f"❌ JSON file not found: {self.json_file_path}")
-            return {}
-        except Exception as e:
-            logger.error(f"❌ Error loading JSON: {e}")
-            return {}
-    
-    def _save_epic_mapping(self, ticker: str, epic: str):
-        """Save new ticker -> EPIC mapping to JSON"""
-        try:
-            # Load existing data
+    def _get_db_connection(self):
+        """Get database connection, create if needed"""
+        if self.db_connection is None or self.db_connection.closed:
             try:
-                with open(self.json_file_path, 'r') as f:
-                    data = json.load(f)
-            except FileNotFoundError:
-                data = {}
+                self.db_connection = psycopg2.connect(
+                    host=os.getenv('DB_HOST', 'localhost'),
+                    port=os.getenv('DB_PORT', '5432'),
+                    database=os.getenv('DB_NAME', os.getenv('DB_DATABASE', 'agents_platform')),
+                    user=os.getenv('DB_USER', 'admin'),
+                    password=os.getenv('DB_PASSWORD', 'secure_agents_password')
+                )
+                logger.debug("Connected to PostgreSQL database")
+            except Exception as e:
+                logger.error(f"Database connection failed: {e}")
+                raise
+        return self.db_connection
+    
+    def _lookup_symbol_in_db(self, ticker: str) -> Optional[Dict]:
+        """Look up symbol in database"""
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             
-            # Add new mapping
-            data[ticker.upper()] = {
-                "epic": epic,
-                "discovered_date": datetime.now().isoformat()[:10],
-                "status": "working"
-            }
+            cursor.execute("""
+                SELECT id, symbol, display_name, epic, asset_type, active
+                FROM hedgefund_agent.stock_universe 
+                WHERE symbol = %s AND active = TRUE;
+            """, (ticker.upper(),))
             
-            # Save back to file
-            with open(self.json_file_path, 'w') as f:
-                json.dump(data, f, indent=2, sort_keys=True)
+            result = cursor.fetchone()
+            cursor.close()
             
-            # Update in-memory cache
-            self.epic_mappings[ticker.upper()] = epic
-            
-            logger.info(f"💾 Saved new mapping: {ticker} -> {epic}")
-            
+            if result:
+                logger.debug(f"Found {ticker} in database: {result['epic']}")
+                return dict(result)
+            else:
+                logger.debug(f"Symbol {ticker} not found in database")
+                return None
+                
         except Exception as e:
-            logger.error(f"❌ Failed to save mapping for {ticker}: {e}")
+            logger.error(f"Database lookup failed for {ticker}: {e}")
+            return None
+    
+    def _save_discovered_symbol(self, ticker: str, epic: str, display_name: str, asset_type: str = 'stock') -> bool:
+        """Save newly discovered symbol to database using the database function"""
+        try:
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            
+            # Use the existing database function
+            cursor.execute("""
+                SELECT add_discovered_symbol(%s, %s, %s, %s);
+            """, (ticker.upper(), display_name, epic, asset_type))
+            
+            result = cursor.fetchone()
+            conn.commit()
+            cursor.close()
+            
+            if result and result[0]:
+                logger.info(f"Saved discovered symbol: {ticker} -> {epic} -> {display_name}")
+                return True
+            else:
+                logger.error(f"Database function returned no result for {ticker}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to save {ticker} to database: {e}")
+            if conn:
+                conn.rollback()
+            return False
     
     def _get_symbol_variations(self, ticker: str) -> List[str]:
         """Generate symbol variations to try"""
@@ -101,8 +116,8 @@ class IGIndexProvider:
     async def _discover_epic(self, ticker: str) -> Optional[str]:
         """Try to discover EPIC for ticker using all prefix/suffix combinations"""
         
-        original_ticker = ticker.upper()   # keep the one from index_constituents
-        logger.info(f"🔍 Discovering EPIC for {original_ticker}")
+        original_ticker = ticker.upper()
+        logger.info(f"Discovering EPIC for {original_ticker}")
         
         variations = self._get_symbol_variations(original_ticker)
         
@@ -117,8 +132,7 @@ class IGIndexProvider:
                     )
                     
                     if market_data and 'snapshot' in market_data:
-                        logger.info(f"🎯 FOUND: {original_ticker} -> {epic}")
-                        self._save_epic_mapping(original_ticker, epic)  # 👈 use original here
+                        logger.info(f"Discovered EPIC: {original_ticker} -> {epic}")
                         return epic
                         
                 except Exception:
@@ -126,7 +140,159 @@ class IGIndexProvider:
                     await asyncio.sleep(2)
                     continue
                     
-        logger.warning(f"❌ No EPIC found for {original_ticker}")
+        logger.warning(f"No EPIC found for {original_ticker}")
+        return None
+    
+    async def _get_market_metadata(self, epic: str) -> Optional[Dict]:
+        """Get market metadata including display name from IG API"""
+        
+        if not self.authenticated:
+            if not await self.authenticate():
+                return None
+        
+        try:
+            # Rate limiting delay
+            await asyncio.sleep(2)
+            
+            # Fetch market details using existing IG service
+            market_data = await asyncio.to_thread(
+                self.ig_service.fetch_market_by_epic, epic
+            )
+            
+            if not market_data or 'instrument' not in market_data:
+                logger.warning(f"No instrument data for EPIC {epic}")
+                return None
+            
+            instrument = market_data['instrument']
+            
+            # Extract relevant metadata
+            metadata = {
+                'epic': epic,
+                'name': instrument.get('name', ''),
+                'type': instrument.get('type', ''),
+                'market_id': instrument.get('marketId', ''),
+                'currency': instrument.get('currencies', [{}])[0].get('code') if instrument.get('currencies') else None,
+                'country': instrument.get('country', ''),
+            }
+            
+            # Clean the name for better display
+            if metadata['name']:
+                metadata['clean_name'] = self._clean_instrument_name(metadata['name'])
+            
+            logger.debug(f"Retrieved metadata for {epic}: {metadata['name']}")
+            return metadata
+            
+        except Exception as e:
+            logger.error(f"Failed to get metadata for {epic}: {e}")
+            return None
+    
+    def _clean_instrument_name(self, raw_name: str) -> str:
+        """Clean instrument names from IG API for better display"""
+        if not raw_name:
+            return raw_name
+        
+        # Remove IG-specific suffixes
+        suffixes_to_remove = [
+            ' DFB',      # Daily Funded Bet
+            ' CFD',      # Contract for Difference  
+            ' Cash',     # Cash market
+            ' (DFB)',
+            ' (CFD)',
+            ' - Cash',
+            ' - DFB'
+        ]
+        
+        cleaned = raw_name.strip()
+        
+        for suffix in suffixes_to_remove:
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[:-len(suffix)].strip()
+        
+        # Remove double spaces
+        cleaned = ' '.join(cleaned.split())
+        
+        # Specific improvements for common IG naming patterns
+        replacements = {
+            'US 500': 'S&P 500',
+            'US Tech 100': 'NASDAQ 100', 
+            'US Wall St 30': 'Dow Jones 30',
+            'Wall Street 30': 'Dow Jones 30',
+            'UK 100': 'FTSE 100',
+            'Germany 40': 'DAX',
+            'Japan 225': 'Nikkei 225',
+            'Hong Kong 40': 'Hang Seng',
+            'France 40': 'CAC 40',
+            'Spain 35': 'IBEX 35',
+            'Australia 200': 'ASX 200',
+        }
+        
+        for old, new in replacements.items():
+            if old in cleaned:
+                cleaned = cleaned.replace(old, new)
+        
+        return cleaned
+    
+    def _infer_asset_type(self, ticker: str, epic: str, metadata: Optional[Dict] = None) -> str:
+        """Infer asset type from ticker, EPIC, and metadata"""
+        ticker = ticker.upper()
+        
+        # Index patterns
+        if (ticker.startswith('^') or 
+            ticker in ['SPY', 'QQQ', 'DIA', 'IWM', 'VIX'] or
+            epic.startswith('IX.')):
+            return 'index'
+        
+        # Forex patterns
+        if (('USD' in ticker and len(ticker) == 6) or
+            ticker.endswith('=X') or
+            epic.startswith('CS.D.')):
+            return 'forex'
+        
+        # Commodity patterns
+        if (ticker in ['GOLD', 'SILVER', 'OIL', 'BRENT', 'NATGAS', 'COPPER'] or
+            ticker.endswith('=F') or
+            epic.startswith('CC.D.') or epic.startswith('MT.D.')):
+            return 'commodity'
+        
+        # Crypto patterns
+        if ticker in ['BTC', 'ETH'] or 'CRYPTO' in (metadata.get('type', '') if metadata else ''):
+            return 'crypto'
+        
+        # Default to stock
+        return 'stock'
+    
+    async def _discover_and_enhance_symbol(self, ticker: str) -> Optional[Dict]:
+        """Complete workflow: discover EPIC, get metadata, save to database"""
+        
+        ticker = ticker.upper()
+        
+        # Step 1: Try to discover EPIC
+        epic = await self._discover_epic(ticker)
+        if not epic:
+            logger.warning(f"Could not discover EPIC for {ticker}")
+            return None
+        
+        # Step 2: Get enhanced metadata
+        metadata = await self._get_market_metadata(epic)
+        display_name = ticker  # fallback
+        asset_type = 'stock'   # fallback
+        
+        if metadata:
+            if metadata.get('clean_name'):
+                display_name = metadata['clean_name']
+            asset_type = self._infer_asset_type(ticker, epic, metadata)
+        
+        # Step 3: Save to database
+        success = self._save_discovered_symbol(ticker, epic, display_name, asset_type)
+        
+        if success:
+            return {
+                'symbol': ticker,
+                'epic': epic,
+                'display_name': display_name,
+                'asset_type': asset_type
+            }
+        
         return None
     
     async def authenticate(self) -> bool:
@@ -150,11 +316,11 @@ class IGIndexProvider:
             
             await asyncio.to_thread(self.ig_service.create_session)
             self.authenticated = True
-            logger.info(f"✅ IG Index authenticated ({config.acc_type})")
+            logger.info(f"IG Index authenticated ({config.acc_type})")
             return True
             
         except Exception as e:
-            logger.error(f"❌ IG authentication failed: {e}")
+            logger.error(f"IG authentication failed: {e}")
             self.authenticated = False
             return False
     
@@ -166,7 +332,7 @@ class IGIndexProvider:
         return price
     
     async def get_price(self, ticker: str) -> Optional[PriceData]:
-        """Get price for ticker - try JSON first, then discovery"""
+        """Get price for ticker - database-first approach"""
         
         if not self.authenticated:
             if not await self.authenticate():
@@ -174,13 +340,17 @@ class IGIndexProvider:
         
         ticker = ticker.upper()
         
-        # Step 1: Check JSON mappings
-        epic = self.epic_mappings.get(ticker)
+        # Step 1: Look up symbol in database
+        symbol_data = self._lookup_symbol_in_db(ticker)
         
-        # Step 2: If not found, try discovery
-        if not epic:
-            epic = await self._discover_epic(ticker)
+        # Step 2: If not found, discover and save
+        if not symbol_data:
+            symbol_data = await self._discover_and_enhance_symbol(ticker)
+            if not symbol_data:
+                logger.warning(f"Could not find or discover {ticker}")
+                return None
         
+        epic = symbol_data['epic']
         if not epic:
             logger.warning(f"No EPIC available for {ticker}")
             return None
@@ -243,11 +413,24 @@ class IGIndexProvider:
                 not ticker.endswith('=F'))
     
     async def health_check(self) -> bool:
-        """Check if IG API is working"""
+        """Check if IG API and database are working"""
         try:
+            # Check database connection
+            conn = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1;")
+            cursor.close()
+            
+            # Check IG authentication
             if not self.authenticated:
                 return await self.authenticate()
             return True
         except Exception as e:
-            logger.error(f"IG health check failed: {e}")
+            logger.error(f"Health check failed: {e}")
             return False
+    
+    def close_connections(self):
+        """Close database connections"""
+        if self.db_connection and not self.db_connection.closed:
+            self.db_connection.close()
+            logger.debug("Database connection closed")

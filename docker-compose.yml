@@ -15,6 +15,13 @@ services:
       - IG_API_KEY=${IG_API_KEY}
       - IG_ACC_TYPE=${IG_ACC_TYPE:-DEMO}
       - REDIS_URL=redis://redis:6379
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - DB_NAME=agents_platform
+      - DB_USER=admin
+      - DB_PASSWORD=secure_agents_password
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     depends_on:

@@ -6,7 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.models import HealthResponse
-from app.routers import prices
+from app.routers import prices, metadata
 from services.aggregator import DataAggregator
 from services.telegram_notifier import (
     get_notifier, 
@@ -33,12 +33,12 @@ aggregator = DataAggregator()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("🚀 Starting Market Data Service...")
+    logger.info("Starting Market Data Service...")
     
     try:
         # Initialize aggregator
         await aggregator.initialize()
-        logger.info("✅ Market Data Service initialized")
+        logger.info("Market Data Service initialized")
         
         # Get provider list with improved error handling
         providers = []
@@ -48,31 +48,31 @@ async def lifespan(app: FastAPI):
             else:
                 # Fallback provider list
                 providers = ['binance', 'yahoo', 'ig_index', 'mexc']
-                logger.warning("⚠️ Using fallback provider list")
+                logger.warning("Using fallback provider list")
         except Exception as e:
-            logger.error(f"❌ Error getting provider list: {e}")
+            logger.error(f"Error getting provider list: {e}")
             providers = ['unknown']
         
         # Send enhanced startup notification
         startup_success = notify_startup(settings.host, settings.port, providers)
         if startup_success:
-            logger.info(f"📊 Enhanced startup notification sent successfully")
+            logger.info("Enhanced startup notification sent successfully")
         else:
-            logger.warning(f"⚠️ Startup notification failed - continuing anyway")
+            logger.warning("Startup notification failed - continuing anyway")
         
         # Start background heartbeat task
         heartbeat_task = asyncio.create_task(heartbeat_background_task())
-        logger.info("💓 Heartbeat task started")
+        logger.info("Heartbeat task started")
         
     except Exception as e:
-        logger.error(f"❌ Failed to start Market Data Service: {e}")
+        logger.error(f"Failed to start Market Data Service: {e}")
         notify_error("Service Startup", str(e))
         raise
     
     yield
     
     # Shutdown
-    logger.info("🛑 Shutting down Market Data Service...")
+    logger.info("Shutting down Market Data Service...")
     try:
         heartbeat_task.cancel()
         await heartbeat_task
@@ -97,9 +97,9 @@ async def heartbeat_background_task():
             # Send appropriate notification based on health
             if healthy_count == total_count:
                 # All healthy - send heartbeat
-                heartbeat_msg = f"💓 *System Heartbeat*\n📊 All {total_count} providers healthy\n🔢 Requests: {stats['total_requests']} \\| Success: {stats['success_rate']}"
+                heartbeat_msg = f"System Heartbeat\nAll {total_count} providers healthy\nRequests: {stats['total_requests']} | Success: {stats['success_rate']}"
                 notifier.send_message(heartbeat_msg)
-                logger.info("💓 Heartbeat sent - all systems healthy")
+                logger.info("Heartbeat sent - all systems healthy")
             else:
                 # Some issues - send health warning
                 failed_providers = [k for k, v in services.items() if not v]
@@ -107,14 +107,14 @@ async def heartbeat_background_task():
                     "Heartbeat Check", 
                     f"Providers down: {', '.join(failed_providers)} ({total_count-healthy_count}/{total_count})"
                 )
-                logger.warning(f"⚠️ Heartbeat detected issues: {len(failed_providers)} providers down")
+                logger.warning(f"Heartbeat detected issues: {len(failed_providers)} providers down")
             
         except asyncio.CancelledError:
-            logger.info("💓 Heartbeat task cancelled")
+            logger.info("Heartbeat task cancelled")
             break
             
         except Exception as e:
-            logger.error(f"❌ Heartbeat task error: {e}")
+            logger.error(f"Heartbeat task error: {e}")
             try:
                 notify_error("Heartbeat Task", str(e))
             except:
@@ -140,11 +140,13 @@ app.add_middleware(
 async def get_aggregator() -> DataAggregator:
     return aggregator
 
-# Include routers
-app.include_router(prices.router)    
+# Include routers with API prefix
+app.include_router(prices.router, prefix="/api/v1")
+app.include_router(metadata.router, prefix="/api/v1")
 
-# Override the dependency AFTER including the router
+# Override the dependency AFTER including the routers
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
+app.dependency_overrides[metadata.get_aggregator] = get_aggregator
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -202,9 +204,14 @@ async def root():
         },
         "endpoints": {
             "health": "/health",
-            "single_price": "/prices/{symbol}",
-            "bulk_prices": "/prices/bulk", 
-            "major_crypto": "/prices/crypto/major",
+            "single_price": "/api/v1/prices/{symbol}",
+            "bulk_prices": "/api/v1/prices/bulk", 
+            "major_crypto": "/api/v1/prices/crypto/major",
+            "provider_status": "/api/v1/prices/status/providers",
+            "metadata_by_epic": "/api/v1/metadata/{epic}",
+            "metadata_by_symbol": "/api/v1/metadata/symbol/{symbol}",
+            "discover_symbol": "/api/v1/metadata/discover/{symbol}",
+            "database_symbols": "/api/v1/metadata/database/symbols",
             "telegram_status": "/telegram/status",
             "telegram_test": "/telegram/test"
         }
@@ -247,7 +254,7 @@ async def test_telegram(message: str = "Enhanced test message with special chars
         from services.telegram_notifier import build_safe_message, NotificationLevel
         
         test_message = build_safe_message(
-            emoji="🧪",
+            emoji="test",
             title="Enhanced Test Message", 
             body=message,
             fields={
@@ -267,7 +274,7 @@ async def test_telegram(message: str = "Enhanced test message with special chars
         }
         
     except Exception as e:
-        logger.error(f"❌ Test error: {e}")
+        logger.error(f"Test error: {e}")
         return {
             "success": False,
             "error": str(e),
@@ -289,7 +296,7 @@ async def manual_heartbeat():
         
         # Send heartbeat
         if healthy_count == total_count:
-            heartbeat_msg = f"💓 *Manual Heartbeat*\n📊 All {total_count} providers healthy\n🔢 Requests: {stats['total_requests']} \\| Success: {stats['success_rate']}"
+            heartbeat_msg = f"Manual Heartbeat\nAll {total_count} providers healthy\nRequests: {stats['total_requests']} | Success: {stats['success_rate']}"
             success = notifier.send_message(heartbeat_msg)
             
             return {
