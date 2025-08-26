@@ -398,9 +398,12 @@ class IGIndexProvider:
             return None
     
     async def get_bulk_prices(self, tickers: List[str]) -> List[Optional[PriceData]]:
-        """Get prices for multiple tickers"""
-        tasks = [self.get_price(ticker) for ticker in tickers]
-        return await asyncio.gather(*tasks, return_exceptions=False)
+        """Get prices for multiple tickers with proper rate limiting"""
+        results = []
+        for ticker in tickers:
+            result = await self.get_price(ticker)  # Uses existing rate limiting
+            results.append(result)
+        return results
     
     def can_handle_symbol(self, ticker: str) -> bool:
         """Check if we can handle this ticker"""
