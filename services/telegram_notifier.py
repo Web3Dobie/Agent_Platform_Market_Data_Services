@@ -247,15 +247,19 @@ class MarketDataTelegramNotifier:
             return self._send_plain_text(simple_msg, NotificationLevel.WARNING)
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get notifier statistics"""
+        """Get notifier statistics with safe calculation"""
+        logger.info(f"Stats: total={self.total_requests}, failed={self.failed_requests}")
         success_rate = 0
-        if self.total_requests > 0:
-            success_rate = ((self.total_requests - self.failed_requests) / self.total_requests * 100)
+        if self.total_requests > 0 and self.failed_requests >= 0:
+            # Ensure failed_requests doesn't exceed total_requests
+            actual_failures = min(self.failed_requests, self.total_requests)
+            success_rate = ((self.total_requests - actual_failures) / self.total_requests * 100)
+            success_rate = max(0, min(100, success_rate))  # Clamp between 0-100
         
         return {
             "enabled": self.enabled,
-            "total_requests": self.total_requests,
-            "failed_requests": self.failed_requests,
+            "total_requests": max(0, self.total_requests),
+            "failed_requests": max(0, min(self.failed_requests, self.total_requests)),
             "success_rate": f"{success_rate:.1f}%",
             "version": "enhanced_safe_v1.0",
             "features": {
