@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from app.models import HealthResponse
 from app.routers import prices, metadata, news
 from services.aggregator import DataAggregator
+from services.data_providers.finnhub import FinnhubProvider
 from services.telegram_notifier import (
     get_notifier, 
     notify_startup, 
