@@ -121,13 +121,6 @@ class FinnhubProvider:
     async def get_company_news(self, symbol: str, days: int = 1) -> List[NewsArticle]:
         """
         Get company-specific news for a symbol
-        
-        Args:
-            symbol: Stock ticker symbol
-            days: Number of days to look back (default: 1)
-            
-        Returns:
-            List of news articles for the symbol
         """
         if not self._initialized or not self.session:
             logger.warning("Finnhub provider not initialized")
@@ -138,15 +131,15 @@ class FinnhubProvider:
             end_date = datetime.utcnow()
             start_date = end_date - timedelta(days=days)
             
-            # Format dates for API (Unix timestamp)
-            start_ts = int(start_date.timestamp())
-            end_ts = int(end_date.timestamp())
+            # FIX: Format dates as YYYY-MM-DD strings for the API
+            start_date_str = start_date.strftime('%Y-%m-%d')
+            end_date_str = end_date.strftime('%Y-%m-%d')
             
             url = f"{self.base_url}/company-news"
             params = {
                 'symbol': symbol.upper(),
-                'from': start_ts,
-                'to': end_ts
+                'from': start_date_str, # Use corrected string format
+                'to': end_date_str     # Use corrected string format
             }
             
             async with self.session.get(url, params=params) as response:
@@ -169,7 +162,6 @@ class FinnhubProvider:
                             symbol=symbol.upper()
                         )
                         
-                        # Filter out empty headlines
                         if article.headline:
                             articles.append(article)
                             
