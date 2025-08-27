@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional, Dict, Any
 from datetime import datetime
 from services.aggregator import DataAggregator
+from services.database_service import get_database_service
 from services.telegram_notifier import notify_error, get_notifier
 import logging
 
@@ -193,102 +194,20 @@ async def discover_and_enhance_symbol(
         
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@router.get("/database/symbols")
 async def get_database_symbols(
     limit: int = 100,
     offset: int = 0,
     asset_type: Optional[str] = None,
-    aggregator: DataAggregator = Depends(get_aggregator)
+    db_service: DatabaseService = Depends(get_database_service)
 ) -> Dict[str, Any]:
     """Get symbols from database with pagination"""
     try:
         logger.info(f"Fetching database symbols: limit={limit}, offset={offset}, asset_type={asset_type}")
         
-        # Get the IG provider
-        ig_provider = None
-        if hasattr(aggregator, 'providers'):
-            ig_provider = aggregator.providers.get('ig_index')
+        result = db_service.get_symbols_by_asset_type(asset_type, limit, offset)
         
-        if not ig_provider:
-            raise HTTPException(
-                status_code=503,
-                detail="IG Index provider not available"
-            )
-        
-        # Get database connection
-        if not hasattr(ig_provider, '_get_db_connection'):
-            raise HTTPException(
-                status_code=501,
-                detail="Database connection not available in IG provider"
-            )
-        
-        conn = ig_provider._get_db_connection()
-        cursor = conn.cursor()
-        
-        # Build query with optional asset type filter
-        base_query = """
-            SELECT symbol, display_name, epic, asset_type, active, discovered_at, last_updated
-            FROM hedgefund_agent.stock_universe
-            WHERE active = TRUE
-        """
-        
-        count_query = """
-            SELECT COUNT(*) 
-            FROM hedgefund_agent.stock_universe 
-            WHERE active = TRUE
-        """
-        
-        params = []
-        
-        if asset_type:
-            base_query += " AND asset_type = %s"
-            count_query += " AND asset_type = %s"
-            params.append(asset_type)
-        
-        # Add ordering and pagination
-        base_query += " ORDER BY symbol LIMIT %s OFFSET %s"
-        params.extend([limit, offset])
-        
-        # Execute queries
-        cursor.execute(base_query, params)
-        symbols = cursor.fetchall()
-        
-        cursor.execute(count_query, params[:-2] if asset_type else [])
-        total_count = cursor.fetchone()[0]
-        
-        cursor.close()
-        
-        # Format response
-        symbol_list = []
-        for row in symbols:
-            symbol_list.append({
-                "symbol": row[0],
-                "display_name": row[1],
-                "epic": row[2],
-                "asset_type": row[3],
-                "active": row[4],
-                "discovered_at": row[5],
-                "last_updated": row[6]
-            })
-        
-        response = {
-            "symbols": symbol_list,
-            "pagination": {
-                "limit": limit,
-                "offset": offset,
-                "total_count": total_count,
-                "returned_count": len(symbol_list)
-            },
-            "filters": {
-                "asset_type": asset_type
-            }
-        }
-        
-        logger.info(f"Retrieved {len(symbol_list)} symbols from database")
-        return response
-        
-    except HTTPException:
-        raise
+        logger.info(f"Retrieved {len(result['symbols'])} symbols from database")
+        return result
         
     except Exception as e:
         error_msg = f"Failed to get database symbols: {str(e)}"
