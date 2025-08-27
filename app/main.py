@@ -6,7 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.models import HealthResponse
-from app.routers import prices, metadata
+from app.routers import prices, metadata, news
 from services.aggregator import DataAggregator
 from services.telegram_notifier import (
     get_notifier, 
@@ -143,10 +143,12 @@ async def get_aggregator() -> DataAggregator:
 # Include routers with API prefix
 app.include_router(prices.router, prefix="/api/v1")
 app.include_router(metadata.router, prefix="/api/v1")
+app.include_router(news.router, prefix="/api/v1")
 
 # Override the dependency AFTER including the routers
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
 app.dependency_overrides[metadata.get_aggregator] = get_aggregator
+app.dependency_overrides[news.get_aggregator] = get_aggregator
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -212,6 +214,10 @@ async def root():
             "metadata_by_symbol": "/api/v1/metadata/symbol/{symbol}",
             "discover_symbol": "/api/v1/metadata/discover/{symbol}",
             "database_symbols": "/api/v1/metadata/database/symbols",
+            "company_news": "/api/v1/news/company/{symbol}",
+            "market_news": "/api/v1/news/market",
+            "ipo_calendar": "/api/v1/calendar/ipo",
+            "earnings_calendar": "/api/v1/calendar/earnings",
             "telegram_status": "/telegram/status",
             "telegram_test": "/telegram/test"
         }

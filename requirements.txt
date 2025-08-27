@@ -13,4 +13,5 @@ requests-oauthlib
 lightstreamer-client-lib
 pandas
 requests
+aiohttp
 psycopg2-binary
