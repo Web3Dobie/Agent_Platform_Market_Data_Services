@@ -170,9 +170,9 @@ class DataAggregator:
         try:
             # Test with common symbols based on provider type
             test_symbols = {
-                'binance': 'BTCUSDT',
-                'mexc': 'BTCUSDT', 
-                'ig_index': 'US500'  # S&P 500
+                'binance': 'BTC',
+                'mexc': 'WAI', 
+                'ig_index': 'SPY'  # S&P 500
             }
             
             test_symbol = test_symbols.get(name, 'BTCUSDT')
