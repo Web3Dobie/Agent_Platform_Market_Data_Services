@@ -23,7 +23,6 @@ class IGIndexProvider:
     def __init__(self):
         self.ig_service = None
         self.authenticated = False
-        self.db_connection = None
         
         # All known prefixes to try for discovery
         self.prefixes = [
@@ -34,37 +33,29 @@ class IGIndexProvider:
         
         logger.info("IG Index provider initialized with database-first approach")
     
-    def _get_db_connection(self):
-        """Get database connection, create if needed"""
-        if self.db_connection is None or self.db_connection.closed:
-            try:
-                self.db_connection = psycopg2.connect(
-                    host=os.getenv('DB_HOST', 'localhost'),
-                    port=os.getenv('DB_PORT', '5432'),
-                    database=os.getenv('DB_NAME', os.getenv('DB_DATABASE', 'agents_platform')),
-                    user=os.getenv('DB_USER', 'admin'),
-                    password=os.getenv('DB_PASSWORD', 'secure_agents_password')
-                )
-                logger.debug("Connected to PostgreSQL database")
-            except Exception as e:
-                logger.error(f"Database connection failed: {e}")
-                raise
-        return self.db_connection
+    def _get_db_params(self) -> dict:
+        """Helper to get database connection parameters from environment variables."""
+        return {
+            'host': os.getenv('DB_HOST', 'localhost'),
+            'port': os.getenv('DB_PORT', '5432'),
+            'database': os.getenv('DB_NAME', os.getenv('DB_DATABASE', 'agents_platform')),
+            'user': os.getenv('DB_USER', 'admin'),
+            'password': os.getenv('DB_PASSWORD', 'secure_agents_password')
+        }
     
     def _lookup_symbol_in_db(self, ticker: str) -> Optional[Dict]:
-        """Look up symbol in database"""
+        """Look up symbol in database with on-demand connection."""
         try:
-            conn = self._get_db_connection()
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            
-            cursor.execute("""
-                SELECT id, symbol, display_name, epic, asset_type, active
-                FROM hedgefund_agent.stock_universe 
-                WHERE symbol = %s AND active = TRUE;
-            """, (ticker.upper(),))
-            
-            result = cursor.fetchone()
-            cursor.close()
+            # The 'with' statement ensures the connection is always closed.
+            with psycopg2.connect(**self._get_db_params()) as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                    cursor.execute("""
+                        SELECT id, symbol, display_name, epic, asset_type, active
+                        FROM hedgefund_agent.stock_universe 
+                        WHERE symbol = %s AND active = TRUE;
+                    """, (ticker.upper(),))
+                    
+                    result = cursor.fetchone()
             
             if result:
                 logger.debug(f"Found {ticker} in database: {result['epic']}")
@@ -78,20 +69,18 @@ class IGIndexProvider:
             return None
     
     def _save_discovered_symbol(self, ticker: str, epic: str, display_name: str, asset_type: str = 'stock') -> bool:
-        """Save newly discovered symbol to database using the database function"""
+        """Save newly discovered symbol to database with on-demand connection."""
         try:
-            conn = self._get_db_connection()
-            cursor = conn.cursor()
-            
-            # Use the existing database function
-            cursor.execute("""
-                SELECT add_discovered_symbol(%s, %s, %s, %s);
-            """, (ticker.upper(), display_name, epic, asset_type))
-            
-            result = cursor.fetchone()
-            conn.commit()
-            cursor.close()
-            
+            # The 'with' statement also handles transactions (commit/rollback).
+            with psycopg2.connect(**self._get_db_params()) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT add_discovered_symbol(%s, %s, %s, %s);
+                    """, (ticker.upper(), display_name, epic, asset_type))
+                    
+                    result = cursor.fetchone()
+                    conn.commit()
+
             if result and result[0]:
                 logger.info(f"Saved discovered symbol: {ticker} -> {epic} -> {display_name}")
                 return True
@@ -101,8 +90,6 @@ class IGIndexProvider:
                 
         except Exception as e:
             logger.error(f"Failed to save {ticker} to database: {e}")
-            if conn:
-                conn.rollback()
             return False
     
     def _get_symbol_variations(self, ticker: str) -> List[str]:
@@ -416,24 +403,18 @@ class IGIndexProvider:
                 not ticker.endswith('=F'))
     
     async def health_check(self) -> bool:
-        """Check if IG API and database are working"""
+        """Check if IG API and database are working."""
         try:
-            # Check database connection
-            conn = self._get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1;")
-            cursor.close()
+            # Check database connection on-demand
+            with psycopg2.connect(**self._get_db_params()) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT 1;")
             
             # Check IG authentication
             if not self.authenticated:
                 return await self.authenticate()
             return True
+            
         except Exception as e:
             logger.error(f"Health check failed: {e}")
             return False
-    
-    def close_connections(self):
-        """Close database connections"""
-        if self.db_connection and not self.db_connection.closed:
-            self.db_connection.close()
-            logger.debug("Database connection closed")
