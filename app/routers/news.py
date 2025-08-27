@@ -9,18 +9,18 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
 from services.data_providers.finnhub import FinnhubProvider, NewsArticle, CalendarEvent
+from services.aggregator import DataAggregator
 
 import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["news"])
 
-# Global provider instance (will be initialized by main.py)
-finnhub_provider = FinnhubProvider()
+
 
 async def get_finnhub() -> FinnhubProvider:
-    """Dependency injection for Finnhub provider"""
-    return finnhub_provider
+    """Dependency injection for Finnhub provider. This will be overridden."""
+    raise NotImplementedError
 
 # =============================================================================
 # NEWS ENDPOINTS

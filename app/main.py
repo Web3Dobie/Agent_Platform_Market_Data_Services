@@ -145,10 +145,14 @@ app.include_router(prices.router, prefix="/api/v1")
 app.include_router(metadata.router, prefix="/api/v1")
 app.include_router(news.router, prefix="/api/v1")
 
+# Get the initialized finnhub instance from the aggregator
+def get_initialized_finnhub() -> FinnhubProvider:
+    return aggregator.providers['finnhub']
+
 # Override the dependency AFTER including the routers
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
 app.dependency_overrides[metadata.get_aggregator] = get_aggregator
-app.dependency_overrides[news.get_finnhub] = lambda: news.finnhub_provider
+app.dependency_overrides[news.get_finnhub] = get_initialized_finnhub
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
