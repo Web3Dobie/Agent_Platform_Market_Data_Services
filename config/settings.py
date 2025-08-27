@@ -1,6 +1,7 @@
 # config/settings.py
 from pydantic_settings import BaseSettings
 from typing import Optional
+import os
 
 class Settings(BaseSettings):
     # Service configuration
@@ -30,9 +31,22 @@ class Settings(BaseSettings):
     crypto_cache_ttl: int = 60      # 1 minute for crypto
     traditional_cache_ttl: int = 300 # 5 minutes for traditional assets
     news_cache_ttl: int = 900       # 15 minutes for news
-    
+
     class Config:
         env_file = ".env"
         extra = "ignore"  # IMPORTANT: Allows extra fields in .env
+
+DATABASE_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', '5432')),
+    'database': os.getenv('DB_NAME', 'agents_platform'),
+    'user': os.getenv('DB_USER', 'admin'),
+    'password': os.getenv('DB_PASSWORD', 'secure_agents_password')
+}
+
+# Only require SSL for remote connections
+# host.docker.internal should be treated as local
+if DATABASE_CONFIG['host'] not in ['localhost', '127.0.0.1', 'host.docker.internal']:
+    DATABASE_CONFIG['sslmode'] = 'require'
 
 settings = Settings()
