@@ -148,7 +148,7 @@ app.include_router(news.router, prefix="/api/v1")
 # Override the dependency AFTER including the routers
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
 app.dependency_overrides[metadata.get_aggregator] = get_aggregator
-app.dependency_overrides[news.get_aggregator] = get_aggregator
+app.dependency_overrides[news.get_finnhub] = lambda: news.finnhub_provider
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
