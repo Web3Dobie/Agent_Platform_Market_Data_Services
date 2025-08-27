@@ -9,7 +9,6 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
 from services.data_providers.finnhub import FinnhubProvider, NewsArticle, CalendarEvent
-from services.cache_service import get_cache_service, CacheService
 
 import logging
 logger = logging.getLogger(__name__)
@@ -31,7 +30,6 @@ async def get_finnhub() -> FinnhubProvider:
 async def get_company_news(
     symbol: str,
     days: int = Query(default=1, ge=1, le=30, description="Days to look back"),
-    cache: CacheService = Depends(get_cache_service),
     provider: FinnhubProvider = Depends(get_finnhub)
 ) -> Dict[str, Any]:
     """
@@ -41,14 +39,7 @@ async def get_company_news(
     - **days**: Number of days to look back (1-30)
     """
     symbol = symbol.upper()
-    cache_key = f"news:company:{symbol}:{days}"
-    
-    # Check cache first (15 minute TTL)
-    cached_result = await cache.get(cache_key)
-    if cached_result:
-        logger.debug(f"📰 Returning cached news for {symbol}")
-        return cached_result
-    
+        
     try:
         articles = await provider.get_company_news(symbol, days=days)
         
@@ -69,10 +60,7 @@ async def get_company_news(
                 for article in articles
             ]
         }
-        
-        # Cache result
-        await cache.set(cache_key, result, ttl=900)  # 15 minutes
-        
+           
         return result
         
     except Exception as e:
@@ -83,7 +71,6 @@ async def get_company_news(
 async def get_market_news(
     category: str = Query(default="general", description="News category"),
     limit: int = Query(default=20, ge=1, le=50, description="Maximum articles"),
-    cache: CacheService = Depends(get_cache_service),
     provider: FinnhubProvider = Depends(get_finnhub)
 ) -> Dict[str, Any]:
     """
@@ -92,14 +79,7 @@ async def get_market_news(
     - **category**: News category (general, forex, crypto, merger)
     - **limit**: Maximum number of articles (1-50)
     """
-    cache_key = f"news:market:{category}:{limit}"
-    
-    # Check cache first (15 minute TTL)
-    cached_result = await cache.get(cache_key)
-    if cached_result:
-        logger.debug(f"📰 Returning cached market news")
-        return cached_result
-    
+
     try:
         articles = await provider.get_market_news(category=category, limit=limit)
         
@@ -118,9 +98,6 @@ async def get_market_news(
             ]
         }
         
-        # Cache result
-        await cache.set(cache_key, result, ttl=900)  # 15 minutes
-        
         return result
         
     except Exception as e:
@@ -133,7 +110,6 @@ async def get_market_news(
 @router.get("/calendar/ipo")
 async def get_ipo_calendar(
     days: int = Query(default=14, ge=1, le=30, description="Days to look ahead"),
-    cache: CacheService = Depends(get_cache_service),
     provider: FinnhubProvider = Depends(get_finnhub)
 ) -> Dict[str, Any]:
     """
@@ -141,13 +117,6 @@ async def get_ipo_calendar(
     
     - **days**: Number of days to look ahead (1-30)
     """
-    cache_key = f"calendar:ipo:{days}"
-    
-    # Check cache first (1 hour TTL for calendar data)
-    cached_result = await cache.get(cache_key)
-    if cached_result:
-        logger.debug(f"Returning cached IPO calendar")
-        return cached_result
     
     try:
         events = await provider.get_ipo_calendar(days=days)
@@ -165,9 +134,6 @@ async def get_ipo_calendar(
             ]
         }
         
-        # Cache result (1 hour)
-        await cache.set(cache_key, result, ttl=3600)
-        
         return result
         
     except Exception as e:
@@ -177,7 +143,6 @@ async def get_ipo_calendar(
 @router.get("/calendar/earnings")  
 async def get_earnings_calendar(
     days: int = Query(default=7, ge=1, le=30, description="Days to look ahead"),
-    cache: CacheService = Depends(get_cache_service),
     provider: FinnhubProvider = Depends(get_finnhub)
 ) -> Dict[str, Any]:
     """
@@ -185,13 +150,6 @@ async def get_earnings_calendar(
     
     - **days**: Number of days to look ahead (1-30)
     """
-    cache_key = f"calendar:earnings:{days}"
-    
-    # Check cache first (1 hour TTL)
-    cached_result = await cache.get(cache_key)
-    if cached_result:
-        logger.debug(f"Returning cached earnings calendar")
-        return cached_result
     
     try:
         events = await provider.get_earnings_calendar(days=days)
@@ -209,9 +167,6 @@ async def get_earnings_calendar(
                 for event in events
             ]
         }
-        
-        # Cache result (1 hour)
-        await cache.set(cache_key, result, ttl=3600)
         
         return result
         
