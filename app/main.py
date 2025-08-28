@@ -6,7 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.models import HealthResponse
-from app.routers import prices, metadata, news
+from app.routers import prices, metadata, news, markets
 from services.aggregator import DataAggregator
 from services.data_providers.finnhub import FinnhubProvider
 from services.telegram_notifier import (
@@ -17,6 +17,7 @@ from services.telegram_notifier import (
 )
 from config.settings import settings
 from datetime import datetime
+from typing import List, Dict, Any
 import logging
 import asyncio
 
@@ -145,6 +146,7 @@ async def get_aggregator() -> DataAggregator:
 app.include_router(prices.router, prefix="/api/v1")
 app.include_router(metadata.router, prefix="/api/v1")
 app.include_router(news.router, prefix="/api/v1")
+app.include_router(markets.router, prefix="/api/v1")
 
 # Get the initialized finnhub instance from the aggregator
 def get_initialized_finnhub() -> FinnhubProvider:
@@ -154,6 +156,7 @@ def get_initialized_finnhub() -> FinnhubProvider:
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
 app.dependency_overrides[metadata.get_aggregator] = get_aggregator
 app.dependency_overrides[news.get_finnhub] = get_initialized_finnhub
+app.dependency_overrides[markets.get_aggregator] = get_aggregator
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -211,13 +214,13 @@ async def root():
         },
         "endpoints": {
             "health": "/health",
+            "search_markets": "/api/v1/markets/search/{search_term}",
             "single_price": "/api/v1/prices/{symbol}",
             "bulk_prices": "/api/v1/prices/bulk", 
             "major_crypto": "/api/v1/prices/crypto/major",
             "provider_status": "/api/v1/prices/status/providers",
             "metadata_by_epic": "/api/v1/metadata/{epic}",
             "metadata_by_symbol": "/api/v1/metadata/symbol/{symbol}",
-            "discover_symbol": "/api/v1/metadata/discover/{symbol}",
             "database_symbols": "/api/v1/metadata/database/symbols",
             "company_news": "/api/v1/news/company/{symbol}",
             "market_news": "/api/v1/news/market",

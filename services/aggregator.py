@@ -392,6 +392,25 @@ class DataAggregator:
             logger.warning(f"Failed symbols: {failed_symbols[:10]}{'...' if len(failed_symbols) > 10 else ''}")
         
         return results
+
+    # EPIC discovery through markets endpoint
+    #==============================================================================
+
+    async def search_markets(self, search_term: str) -> List[Dict[str, Any]]:
+        """
+        Delegates market search to the IG Index provider.
+        """
+        if 'ig_index' in self.providers:
+            provider = self.providers['ig_index']
+            # Ensure the provider has the method before calling it
+            if hasattr(provider, 'search_markets'):
+                return await provider.search_markets(search_term)
+            else:
+                self.logger.warning("ig_index provider does not have a search_markets method.")
+                return []
+        else:
+            self.logger.warning("IG Index provider not available for market search.")
+            return []
     
     # NEWS AND CALENDAR METHODS (New Finnhub Integration)
     # =============================================================================
