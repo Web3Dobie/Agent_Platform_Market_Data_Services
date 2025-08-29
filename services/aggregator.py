@@ -330,68 +330,80 @@ class DataAggregator:
         logger.warning(f"Failed to get price for {symbol} from all available providers")
         return None
     
-    async def get_bulk_prices(self, symbols: List[str], max_concurrent: int = 10) -> List[PriceData]:
+    async def get_price_with_retry(self, symbol: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
         """
-        Enhanced bulk price fetching with concurrency control and better error handling
+        Wrapper to fetch a single price with a simple retry mechanism.
         """
-        if not symbols:
-            return []
+        for attempt in range(max_retries):
+            try:
+                price_data = await self.get_price(symbol)
+                if price_data:
+                    return price_data
+                logger.warning(f"Attempt {attempt + 1} for {symbol} returned no data. Retrying...")
+                await asyncio.sleep(1) # Small delay before retry
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} for {symbol} failed with error: {e}. Retrying...")
+                await asyncio.sleep(1)
         
-        logger.info(f"Fetching bulk prices for {len(symbols)} symbols (max concurrent: {max_concurrent})")
+        logger.error(f"All {max_retries} retries failed for {symbol}.")
+        return None
+
+    # In services/aggregator.py
+
+    async def get_bulk_prices(self, symbols: List[str]) -> Dict[str, Any]:
+        """
+        Fetches bulk prices with correct provider routing and matches the
+        BulkPriceResponse Pydantic model.
+        """
+        logger.info(f"Fetching bulk prices for {len(symbols)} symbols.")
         
-        results = []
-        failed_symbols = []
-        
-        # Use semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def get_single_with_semaphore(symbol: str):
-            async with semaphore:
-                try:
-                    price_data = await self.get_price(symbol)
+        ig_symbols = []
+        other_symbols = []
+        for symbol in symbols:
+            asset_type = self._detect_asset_type(symbol)
+            provider_list = self._get_providers_for_symbol(symbol, asset_type)
+            if provider_list and provider_list[0] == 'ig_index':
+                ig_symbols.append(symbol)
+            else:
+                other_symbols.append(symbol)
+
+        all_prices = []
+        failed_symbols = []  # +++ FIX: Initialize the list here
+
+        if other_symbols:
+            logger.info(f"Processing {len(other_symbols)} symbols concurrently (non-IG).")
+            tasks = [self.get_price(symbol) for symbol in other_symbols]
+            results = await asyncio.gather(*tasks)
+            all_prices.extend([p for p in results if p])
+
+        if ig_symbols:
+            logger.info(f"Processing {len(ig_symbols)} symbols sequentially for IG provider.")
+            ig_provider = self.providers.get('ig_index')
+            
+            if ig_provider and self._provider_ready.get('ig_index'):
+                for symbol in ig_symbols:
+                    await asyncio.sleep(0.5) 
+                    price_data = await self.get_price_with_retry(symbol, max_retries=1)
                     if price_data:
-                        return symbol, price_data
+                        all_prices.append(price_data)
                     else:
                         failed_symbols.append(symbol)
-                        return symbol, None
-                except Exception as e:
-                    logger.warning(f"Bulk request failed for {symbol}: {e}")
-                    failed_symbols.append(symbol)
-                    return symbol, None
+            else:
+                logger.error("IG provider not ready. Skipping all IG symbols.")
+                failed_symbols.extend(ig_symbols)
+
+        successful_symbols_set = {p.symbol for p in all_prices}
+        failed_symbols = [s for s in symbols if s not in successful_symbols_set]
         
-        # Create tasks for all symbols
-        tasks = [get_single_with_semaphore(symbol) for symbol in symbols]
-        
-        try:
-            # Execute all requests with overall timeout
-            task_results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=120.0  # 2 minute timeout for bulk operation
-            )
-            
-            # Process results
-            for result in task_results:
-                if isinstance(result, tuple) and len(result) == 2:
-                    symbol, price_data = result
-                    if price_data:
-                        results.append(price_data)
-                elif isinstance(result, Exception):
-                    logger.warning(f"Bulk request task failed: {result}")
-        
-        except asyncio.TimeoutError:
-            logger.error("Bulk price request timed out")
-        except Exception as e:
-            logger.error(f"Bulk price request failed: {e}")
-        
-        success_count = len(results)
-        total_count = len(symbols)
-        
-        logger.info(f"Bulk request complete: {success_count}/{total_count} successful")
-        
+        logger.info(f"Bulk request complete: {len(all_prices)}/{len(symbols)} successful.")
         if failed_symbols:
-            logger.warning(f"Failed symbols: {failed_symbols[:10]}{'...' if len(failed_symbols) > 10 else ''}")
-        
-        return results
+            logger.warning(f"Failed symbols: {failed_symbols}")
+            
+        return {
+            "data": all_prices,
+            "failed_symbols": failed_symbols,
+            "timestamp": datetime.utcnow()
+        }
 
     # EPIC discovery through markets endpoint
     #==============================================================================
@@ -563,7 +575,7 @@ class DataAggregator:
         symbol_upper = symbol.upper().replace("$", "")
         
         # Crypto detection
-        crypto_symbols = ["BTC", "ETH", "SOL", "AVAX", "DOT", "ADA", "XRP", "DOGE", "MATIC", "LINK"]
+        crypto_symbols = ["BTC", "ETH", "SOL", "AVAX", "DOT", "ADA", "XRP", "DOGE", "MATIC", "LINK", "WAI"]
         if any(crypto in symbol_upper for crypto in crypto_symbols):
             return AssetType.CRYPTO
         

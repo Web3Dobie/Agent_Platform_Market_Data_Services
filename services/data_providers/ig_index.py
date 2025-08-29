@@ -229,9 +229,11 @@ class IGIndexProvider:
             return 'crypto'
         return 'stock'
 
-    # --- NO CHANGES to authenticate or _normalize_price ---
-    async def authenticate(self) -> bool:
-        """Authenticate with IG Index"""
+    async def initialize(self) -> bool:
+        """Connects and authenticates with IG Index. Should be called once."""
+        if self.authenticated:
+            return True # Already connected
+
         try:
             if not all([settings.ig_username, settings.ig_password, settings.ig_api_key]):
                 logger.error("IG credentials not configured")
@@ -246,7 +248,7 @@ class IGIndexProvider:
             
             await asyncio.to_thread(self.ig_service.create_session)
             self.authenticated = True
-            logger.info(f"IG Index authenticated ({config.acc_type})")
+            logger.info(f"IG Index session established ({config.acc_type})")
             return True
             
         except Exception as e:
@@ -264,17 +266,15 @@ class IGIndexProvider:
     async def get_price(self, ticker: str) -> Optional[PriceData]:
         """Get price for ticker - database-first approach with search-based discovery"""
         if not self.authenticated:
-            if not await self.authenticate():
+            is_ready = await self.initialize()
+            if not is_ready:
+                logger.error("IG provider is not authenticated. Cannot get price.")
                 return None
         
         ticker = ticker.upper()
-        
-        # Step 1: Look up symbol in database
         symbol_data = self._lookup_symbol_in_db(ticker)
         
-        # Step 2: If not found, discover and save using the NEW method
         if not symbol_data:
-            # This now calls our new, smarter discovery function
             symbol_data = await self._discover_and_enhance_symbol(ticker)
             if not symbol_data:
                 logger.warning(f"Could not find or discover {ticker}")
@@ -293,20 +293,38 @@ class IGIndexProvider:
                 return None
             
             snapshot = market_data['snapshot']
-            raw_price = float(snapshot.get('bid', 0) or snapshot.get('offer', 0))
+            
+            # --- ROBUST PRICE PARSING ---
+            bid_price = snapshot.get('bid')
+            offer_price = snapshot.get('offer')
+
+            # Use the first valid price available, otherwise default to 0.0
+            raw_price = 0.0
+            if bid_price is not None:
+                raw_price = float(bid_price)
+            elif offer_price is not None:
+                raw_price = float(offer_price)
+            # --- END OF FIX ---
+            
             if raw_price == 0:
-                logger.warning(f"Zero price for {ticker}")
+                logger.warning(f"Zero or None price for {ticker} ({epic})")
                 return None
             
             price = self._normalize_price(raw_price, epic)
-            change_percent = float(snapshot.get('percentageChange', 0))
-            change_absolute = float(snapshot.get('netChange', 0))
+            
+            # Handle potentially None change values as well
+            change_percent = float(snapshot.get('percentageChange') or 0.0)
+            change_absolute = float(snapshot.get('netChange') or 0.0)
             
             if epic.startswith(('UA.D.', 'UB.D.', 'UC.D.', 'UD.D.', 'UE.D.', 'UF.D.', 'UG.D.', 'UH.D.', 'UI.D.', 'UJ.D.', 'SH.D.', 'SA.D.', 'SB.D.', 'SC.D.', 'SD.D.', 'SE.D.', 'SF.D.', 'SG.D.')):
                 change_absolute = change_absolute / 100
             
+            # Use the asset_type from the database
+            asset_type_str = symbol_data.get('asset_type', 'stock')
+            asset_type = AssetType(asset_type_str) if asset_type_str in AssetType.__members__ else AssetType.EQUITY
+            
             return PriceData(
-                symbol=ticker, asset_type=AssetType.EQUITY, price=price,
+                symbol=ticker, asset_type=asset_type, price=price,
                 change_percent=change_percent, change_absolute=change_absolute,
                 volume=None, timestamp=datetime.utcnow(), source="ig_index"
             )
@@ -325,14 +343,21 @@ class IGIndexProvider:
         return results
     
     def can_handle_symbol(self, ticker: str) -> bool:
-        """Check if we can handle this ticker"""
+        """
+        Check if the IG provider should handle this symbol.
+        This is now more flexible to allow for indices and forex symbols.
+        """
         ticker = ticker.upper()
-        return (len(ticker) <= 6 and 
-                ticker.replace('.', '').isalpha() and 
-                not ticker.startswith('^') and
-                not ticker.endswith('=X') and
-                not ticker.endswith('=F'))
-    
+        # IG is the primary provider for non-crypto assets.
+        # We will let it handle anything that doesn't look like a typical
+        # crypto pair from Binance/MEXC.
+        # This is a simple exclusion rule.
+        if ticker.endswith('USDT') or ticker in ['BTC', 'ETH', 'SOL', 'ADA', 'XRP']:
+            return False
+        
+        # Otherwise, assume IG can handle it.
+        return True
+
     async def health_check(self) -> bool:
         """Check if IG API and database are working."""
         try:

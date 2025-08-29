@@ -20,102 +20,89 @@ def get_aggregator() -> DataAggregator:
     # This will be properly injected in main.py
     pass
 
-@router.get("/{symbol}", response_model=PriceData)
-async def get_price(
-    symbol: str, 
-    aggregator: DataAggregator = Depends(get_aggregator)
-) -> PriceData:
-    """Get current price for a single symbol with error logging"""
+@router.get("/{symbol}")
+async def get_price(symbol: str, aggregator: DataAggregator = Depends(get_aggregator)):
+    """Get price for a symbol with automatic normalization"""
     try:
-        logger.info(f"📊 Fetching price for symbol: {symbol}")
+        # Normalize the symbol first
+        normalized = normalizer.normalize_symbol(symbol)
         
-        # Increment request counter
-        notifier = get_notifier()
-        notifier.total_requests += 1
+        logger.info(f"📊 Price request: {symbol} -> {normalized.clean_symbol} ({normalized.asset_type})")
         
-        # DEBUG: Check if aggregator is properly initialized
-        logger.debug(f"Aggregator type: {type(aggregator)}")
-        if hasattr(aggregator, 'providers'):
-            logger.debug(f"Providers: {list(aggregator.providers.keys())}")
+        # Use the clean symbol for the existing logic
+        price_data = await aggregator.get_price(normalized.clean_symbol)
         
-        # Get price data
-        price_data = await aggregator.get_price(symbol)
-        
-        if not price_data:
-            error_msg = f"Symbol {symbol} not found"
-            logger.warning(f"⚠️ {error_msg}")
-            raise HTTPException(status_code=404, detail=error_msg)
-        
-        logger.info(f"✅ Successfully fetched {symbol}: ${price_data.price}")
-        return price_data
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions (already handled above)
-        notifier.failed_requests += 1
-        raise
-        
+        if price_data:
+            # Add normalization info to response
+            response_data = {
+                "symbol": normalized.clean_symbol,
+                "original_symbol": symbol,
+                "asset_type": price_data.asset_type.value,
+                "price": price_data.price,
+                "change_percent": price_data.change_percent,
+                "change_absolute": price_data.change_absolute,
+                "volume": price_data.volume,
+                "market_cap": price_data.market_cap,
+                "timestamp": price_data.timestamp,
+                "source": price_data.source,
+                # Add normalization metadata
+                "normalization": {
+                    "ig_epic": normalized.ig_epic,
+                    "confidence": normalized.confidence,
+                    "detected_type": normalized.asset_type
+                }
+            }
+            return response_data
+        else:
+            raise HTTPException(status_code=404, detail=f"Price data not found for {symbol}")
+            
     except Exception as e:
-        notifier.failed_requests += 1
-        error_msg = f"Internal error fetching {symbol}: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        # Notify on unexpected errors
-        notify_error(f"Price Request ({symbol})", str(e))
-        
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Price fetch error for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/bulk", response_model=BulkPriceResponse)
 async def get_bulk_prices(
     request: BulkPriceRequest,
     aggregator: DataAggregator = Depends(get_aggregator)
 ) -> BulkPriceResponse:
-    """Get prices for multiple symbols with error logging"""
+    """
+    Get prices for multiple symbols, leveraging the aggregator's enhanced response.
+    """
     symbol_count = len(request.symbols)
+    notifier = get_notifier()
     
     try:
         logger.info(f"📊 Bulk price request for {symbol_count} symbols: {request.symbols[:5]}{'...' if symbol_count > 5 else ''}")
         
-        # Increment request counter
-        notifier = get_notifier()
+        # The aggregator now handles all the logic for success/failure.
+        # It returns a dictionary that exactly matches our response model.
+        result_dict = await aggregator.get_bulk_prices(request.symbols)
+        
+        # --- Simplified Logic ---
+        success_count = len(result_dict["data"])
+        failed_count = len(result_dict["failed_symbols"])
+        
         notifier.total_requests += symbol_count
-        
-        # Get bulk prices
-        results = await aggregator.get_bulk_prices(request.symbols)
-        
-        # Process results
-        successful = [r for r in results if r is not None]
-        failed = [s for s, r in zip(request.symbols, results) if r is None]
-        
-        success_count = len(successful)
-        failed_count = len(failed)
-        
+        notifier.failed_requests += failed_count
+
         logger.info(f"✅ Bulk request completed: {success_count}/{symbol_count} successful")
         
-        # Only notify on high failure rates (>50%)
+        # Notify on high failure rates
         if failed_count > symbol_count / 2:
-            failure_rate = (failed_count / symbol_count) * 100
+            failure_rate = (failed_count / symbol_count) * 100 if symbol_count > 0 else 0
             notify_error(
                 "Bulk Request High Failure", 
-                f"{failed_count}/{symbol_count} failed ({failure_rate:.1f}%) - Symbols: {', '.join(failed[:3])}{'...' if len(failed) > 3 else ''}"
+                f"{failed_count}/{symbol_count} failed ({failure_rate:.1f}%)"
             )
-            notifier.failed_requests += failed_count
-            logger.warning(f"⚠️ High failure rate: {failure_rate:.1f}%")
-        
-        return BulkPriceResponse(
-            data=successful,
-            failed_symbols=failed,
-            timestamp=datetime.utcnow()
-        )
+
+        return result_dict
         
     except Exception as e:
         notifier.failed_requests += symbol_count
         error_msg = f"Bulk request failed for {symbol_count} symbols: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        # Always notify bulk request failures
+        logger.error(f"❌ {error_msg}", exc_info=True) # exc_info=True gives more debug info
         notify_error("Bulk Price Request", str(e))
-        
-        raise HTTPException(status_code=500, detail=f"Bulk request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="An internal error occurred during the bulk request.")
 
 @router.get("/crypto/major")
 async def get_major_crypto(aggregator: DataAggregator = Depends(get_aggregator)):
@@ -237,43 +224,3 @@ async def test_symbol_request(
             "success": False,
             "error": error_msg
         }
-
-@router.get("/{symbol}")
-async def get_price(symbol: str, aggregator: DataAggregator = Depends(get_aggregator)):
-    """Get price for a symbol with automatic normalization"""
-    try:
-        # 🆕 Normalize the symbol first
-        normalized = normalizer.normalize_symbol(symbol)
-        
-        logger.info(f"📊 Price request: {symbol} -> {normalized.clean_symbol} ({normalized.asset_type})")
-        
-        # Use the clean symbol for the existing logic
-        price_data = await aggregator.get_price(normalized.clean_symbol)
-        
-        if price_data:
-            # Add normalization info to response
-            response_data = {
-                "symbol": normalized.clean_symbol,
-                "original_symbol": symbol,
-                "asset_type": price_data.asset_type.value,
-                "price": price_data.price,
-                "change_percent": price_data.change_percent,
-                "change_absolute": price_data.change_absolute,
-                "volume": price_data.volume,
-                "market_cap": price_data.market_cap,
-                "timestamp": price_data.timestamp,
-                "source": price_data.source,
-                # 🆕 Add normalization metadata
-                "normalization": {
-                    "ig_epic": normalized.ig_epic,
-                    "confidence": normalized.confidence,
-                    "detected_type": normalized.asset_type
-                }
-            }
-            return response_data
-        else:
-            raise HTTPException(status_code=404, detail=f"Price data not found for {symbol}")
-            
-    except Exception as e:
-        logger.error(f"Price fetch error for {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
