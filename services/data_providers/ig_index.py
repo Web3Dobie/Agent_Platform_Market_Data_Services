@@ -10,11 +10,11 @@ import psycopg2
 import psycopg2.extras
 import os
 import pandas as pd
-from typing import Optional, List, Dict, Any # Added Any
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from app.models import PriceData, AssetType
 from config.settings import settings
-from requests.exceptions import HTTPError
+from requests.exceptions import HTTPError, ConnectionError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,25 +25,21 @@ class IGIndexProvider:
     def __init__(self):
         self.ig_service = None
         self.authenticated = False
-        self._lock = asyncio.Lock() # Add a lock to prevent race conditions during re-authentication
+        self._lock = asyncio.Lock()
         logger.info("IG Index provider initialized with self-healing session logic.")
     
     async def initialize(self) -> bool:
-        """Connects and authenticates with IG Index using credentials from settings."""
+        """Connects and authenticates with IG Index. Called once on startup or during self-healing."""
         async with self._lock:
-            # If we are already authenticated, do nothing.
             if self.authenticated:
                 return True
 
             logger.info("Attempting to establish IG Index session...")
             try:
-                # Check if settings are configured
                 if not all([settings.ig_username, settings.ig_password, settings.ig_api_key]):
-                    logger.error("IG credentials not found in settings.py")
+                    logger.error("IG credentials not found in settings.")
                     return False
                 
-                # Explicitly create the IGService instance with your credentials
-                # This is your original, correct method that overrides the library's default behavior.
                 self.ig_service = IGService(
                     username=settings.ig_username,
                     password=settings.ig_password,
@@ -51,7 +47,6 @@ class IGIndexProvider:
                     acc_type=settings.ig_acc_type
                 )
                 
-                # Use to_thread for the synchronous library call
                 await asyncio.to_thread(self.ig_service.create_session)
                 
                 self.authenticated = True
@@ -64,100 +59,75 @@ class IGIndexProvider:
                 self.ig_service = None
                 return False
 
-    # --- NEW METHOD: Checks and refreshes the session if stale ---
     async def _ensure_session_is_active(self):
-        """
-        Performs a cheap, lightweight check to see if the session is active.
-        If an authentication error occurs, it triggers a full re-initialization.
-        """
+        """Checks and refreshes the session if stale or disconnected."""
         if not self.authenticated or not self.ig_service:
-            logger.warning("Session not authenticated, attempting to initialize.")
             await self.initialize()
             return
-
         try:
-            # Make a cheap, non-blocking API call to fetch account details.
-            # This is a reliable way to confirm the session is still active.
             await asyncio.to_thread(self.ig_service.fetch_accounts)
-            
-        except HTTPError as e:
-            # Specifically catch HTTP errors like 403
-            if e.response.status_code == 403:
-                logger.warning(f"IG session check returned 403 Forbidden. Assuming rate-limit or stale session. Re-authenticating...")
-                self.authenticated = False
-                await self.initialize()
-            else:
-                # Re-raise other HTTP errors
-                raise e
         except Exception as e:
             error_message = str(e).lower()
-            if "security" in error_message or "token" in error_message:
-                logger.warning(f"IG session appears stale ({e}). Re-authenticating...")
+            if isinstance(e, (ConnectionError, HTTPError)) or "security" in error_message or "token" in error_message:
+                logger.warning(f"IG session appears dead ({type(e).__name__}). Re-authenticating...")
                 self.authenticated = False
                 await self.initialize()
             else:
                 logger.error(f"Unexpected error checking IG session status: {e}")
                 raise e
     
-    # --- NO CHANGES to _get_db_params, _lookup_symbol_in_db, _save_discovered_symbol ---
     def _get_db_params(self) -> dict:
-        """Helper to get database connection parameters from environment variables."""
+        """Helper to get database connection parameters."""
         return {
             'host': os.getenv('DB_HOST', 'localhost'),
             'port': os.getenv('DB_PORT', '5432'),
-            'database': os.getenv('DB_NAME', os.getenv('DB_DATABASE', 'agents_platform')),
+            'database': os.getenv('DB_NAME', 'agents_platform'),
             'user': os.getenv('DB_USER', 'admin'),
             'password': os.getenv('DB_PASSWORD', 'secure_agents_password')
         }
     
-    def _lookup_symbol_in_db(self, ticker: str) -> Optional[Dict]:
-        """Look up symbol in database with on-demand connection."""
-        try:
-            with psycopg2.connect(**self._get_db_params()) as conn:
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
-                    cursor.execute("""
-                        SELECT id, symbol, display_name, epic, asset_type, active
-                        FROM hedgefund_agent.stock_universe 
-                        WHERE symbol = %s AND active = TRUE;
-                    """, (ticker.upper(),))
-                    
-                    result = cursor.fetchone()
-            
-            if result:
-                logger.debug(f"Found {ticker} in database: {result['epic']}")
-                return dict(result)
-            else:
-                logger.debug(f"Symbol {ticker} not found in database")
+    async def _lookup_symbol_in_db(self, ticker: str) -> Optional[Dict]:
+        """Asynchronously look up symbol in database to avoid blocking."""
+        def db_call():
+            try:
+                with psycopg2.connect(**self._get_db_params()) as conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                        cursor.execute(
+                            "SELECT * FROM hedgefund_agent.stock_universe WHERE symbol = %s AND active = TRUE;",
+                            (ticker.upper(),)
+                        )
+                        return cursor.fetchone()
+            except Exception as e:
+                logger.error(f"Database lookup failed for {ticker}: {e}")
                 return None
-                
-        except Exception as e:
-            logger.error(f"Database lookup failed for {ticker}: {e}")
-            return None
+        
+        result = await asyncio.to_thread(db_call)
+        if result:
+            logger.debug(f"Found {ticker} in database: {result.get('epic')}")
+            return dict(result)
+        return None
     
-    def _save_discovered_symbol(self, ticker: str, epic: str, display_name: str, asset_type: str = 'stock') -> bool:
-        """Save newly discovered symbol to database with on-demand connection."""
-        try:
-            with psycopg2.connect(**self._get_db_params()) as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT add_discovered_symbol(%s, %s, %s, %s);
-                    """, (ticker.upper(), display_name, epic, asset_type))
-                    
-                    result = cursor.fetchone()
-                    conn.commit()
+    async def _save_discovered_symbol(self, ticker: str, epic: str, display_name: str, asset_type: str = 'stock') -> bool:
+        """Asynchronously save newly discovered symbol to database."""
+        def db_call():
+            try:
+                with psycopg2.connect(**self._get_db_params()) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT add_discovered_symbol(%s, %s, %s, %s);",
+                            (ticker.upper(), display_name, epic, asset_type)
+                        )
+                        return cursor.fetchone()
+            except Exception as e:
+                logger.error(f"Failed to save {ticker} to database: {e}")
+                return None
 
-            if result and result[0]:
-                logger.info(f"Saved discovered symbol: {ticker} -> {epic} -> {display_name}")
-                return True
-            else:
-                logger.error(f"Database function returned no result for {ticker}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to save {ticker} to database: {e}")
-            return False
+        result = await asyncio.to_thread(db_call)
+        if result and result[0]:
+            logger.info(f"Saved discovered symbol: {ticker} -> {epic}")
+            return True
+        return False
 
-    # --- NEW METHOD --- Implements the actual API search call.
     async def search_markets(self, search_term: str) -> List[Dict[str, Any]]:
         """
         Calls the IG API to search for markets matching the search_term.
@@ -189,8 +159,6 @@ class IGIndexProvider:
             logger.error(f"IG: Error searching markets for '{search_term}': {e}")
             return []
 
-
-    # --- REPLACED --- This is the new, intelligent discovery workflow.
     async def _discover_and_enhance_symbol(self, ticker: str) -> Optional[Dict]:
         """
         New workflow: search for a symbol, filter results, select the best match,
@@ -243,7 +211,6 @@ class IGIndexProvider:
         
         return None
 
-    # --- NO CHANGES to _get_market_metadata, _clean_instrument_name, or _infer_asset_type ---
     async def _get_market_metadata(self, epic: str) -> Optional[Dict]:
         """Get market metadata including display name from IG API"""
         try:
@@ -311,19 +278,14 @@ class IGIndexProvider:
             return price / 100
         return price
 
-    # --- UPDATED get_price --- This method's logic remains the same, but it now calls the new discovery function.
     async def get_price(self, ticker: str) -> Optional[PriceData]:
-        """Get price for ticker with self-healing session logic."""
+        """Get price for ticker with self-healing session and async DB calls."""
         try:
             await self._ensure_session_is_active()
-            
             if not self.authenticated:
-                logger.error("IG provider is not authenticated. Cannot get price.")
                 return None
             
-            ticker = ticker.upper()
-            symbol_data = self._lookup_symbol_in_db(ticker)
-            
+            symbol_data = await self._lookup_symbol_in_db(ticker)
             if not symbol_data:
                 symbol_data = await self._discover_and_enhance_symbol(ticker)
                 if not symbol_data:
@@ -335,56 +297,43 @@ class IGIndexProvider:
                 logger.warning(f"No EPIC available for {ticker}")
                 return None
             
-            # This nested try/except is for the specific API call
-            try:
-                market_data = await asyncio.to_thread(self.ig_service.fetch_market_by_epic, epic)
-                
-                if not market_data or 'snapshot' not in market_data:
-                    logger.warning(f"No data for {ticker} ({epic})")
-                    return None
-                
-                snapshot = market_data['snapshot']
-                
-                bid_price = snapshot.get('bid')
-                offer_price = snapshot.get('offer')
-
-                raw_price = 0.0
-                if bid_price is not None:
-                    raw_price = float(bid_price)
-                elif offer_price is not None:
-                    raw_price = float(offer_price)
-                
-                if raw_price == 0:
-                    logger.warning(f"Zero or None price for {ticker} ({epic})")
-                    return None
-                
-                price = self._normalize_price(raw_price, epic)
-                
-                change_percent = float(snapshot.get('percentageChange') or 0.0)
-                change_absolute = float(snapshot.get('netChange') or 0.0)
-                
-                if epic.startswith(('UA.D.', 'UB.D.', 'UC.D.', 'UD.D.', 'UE.D.', 'UF.D.', 'UG.D.', 'UH.D.', 'UI.D.', 'UJ.D.', 'SH.D.', 'SA.D.', 'SB.D.', 'SC.D.', 'SD.D.', 'SE.D.', 'SF.D.', 'SG.D.')):
-                    change_absolute = change_absolute / 100
-                
-                asset_type_str = symbol_data.get('asset_type', 'stock')
-                asset_type = AssetType(asset_type_str) if asset_type_str in AssetType.__members__ else AssetType.EQUITY
-                
-                return PriceData(
-                    symbol=ticker, asset_type=asset_type, price=price,
-                    change_percent=change_percent, change_absolute=change_absolute,
-                    volume=None, timestamp=datetime.utcnow(), source="ig_index"
-                )
-                
-            except Exception as e:
-                logger.error(f"IG API error for {ticker}: {e}")
+            market_data = await asyncio.to_thread(self.ig_service.fetch_market_by_epic, epic)
+            
+            if not market_data or 'snapshot' not in market_data:
+                logger.warning(f"No data for {ticker} ({epic})")
                 return None
-                
-        # This is the outer except block for the whole function
+            
+            snapshot = market_data['snapshot']
+            bid_price = snapshot.get('bid')
+            offer_price = snapshot.get('offer')
+
+            raw_price = 0.0
+            if bid_price is not None:
+                raw_price = float(bid_price)
+            elif offer_price is not None:
+                raw_price = float(offer_price)
+            
+            if raw_price == 0:
+                logger.warning(f"Zero or None price for {ticker} ({epic})")
+                return None
+            
+            price = self._normalize_price(raw_price, epic)
+            change_percent = float(snapshot.get('percentageChange') or 0.0)
+            change_absolute = float(snapshot.get('netChange') or 0.0)
+
+            asset_type_str = symbol_data.get('asset_type', 'stock')
+            asset_type = AssetType[asset_type_str.upper()] if hasattr(AssetType, asset_type_str.upper()) else AssetType.EQUITY
+            
+            return PriceData(
+                symbol=ticker, asset_type=asset_type, price=price,
+                change_percent=change_percent, change_absolute=change_absolute,
+                volume=None, timestamp=datetime.utcnow(), source="ig_index"
+            )
+            
         except Exception as e:
-            logger.error(f"An unexpected error occurred in get_price for {ticker}: {e}")
+            logger.error(f"An unexpected error occurred in get_price for {ticker}: {e}", exc_info=True)
             return None
             
-    # --- NO CHANGES to get_bulk_prices, can_handle_symbol, or health_check ---
     async def get_bulk_prices(self, tickers: List[str]) -> List[Optional[PriceData]]:
         """Get prices for multiple tickers with proper rate limiting"""
         results = []
@@ -410,16 +359,16 @@ class IGIndexProvider:
         return True
 
     async def health_check(self) -> bool:
-        """Check if the provider believes it's authenticated and the DB is reachable."""
-        db_ok = False
-        try:
-            with psycopg2.connect(**self._get_db_params()) as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT 1;")
-            db_ok = True
-        except Exception as e:
-            logger.error(f"Health check failed to connect to DB: {e}")
-            db_ok = False
-        
-        # Return True only if both the DB is reachable and the session is marked as active
+        """Asynchronously check if the provider is authenticated and the DB is reachable."""
+        def db_check_call():
+            try:
+                with psycopg2.connect(**self._get_db_params()) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT 1;")
+                return True
+            except Exception as e:
+                logger.error(f"Health check failed to connect to DB: {e}")
+                return False
+
+        db_ok = await asyncio.to_thread(db_check_call)
         return self.authenticated and db_ok
