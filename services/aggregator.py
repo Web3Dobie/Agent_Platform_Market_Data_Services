@@ -332,7 +332,7 @@ class DataAggregator:
         logger.warning(f"Failed to get price for {symbol} from all available providers")
         return None
     
-    async def get_price_with_retry(self, symbol: str, max_retries: int = 2) -> Optional[Dict[str, Any]]:
+    async def get_price_with_retry(self, symbol: str, max_retries: int = 2, ensure_session: bool = True) -> Optional[Dict[str, Any]]:
         """
         Wrapper to fetch a single price with a simple retry mechanism.
         """

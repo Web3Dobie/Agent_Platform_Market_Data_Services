@@ -281,8 +281,13 @@ class IGIndexProvider:
     async def get_price(self, ticker: str) -> Optional[PriceData]:
         """Get price for ticker with self-healing session and async DB calls."""
         try:
-            await self._ensure_session_is_active()
+            # Only run the check if the flag is True
+            if ensure_session:
+                await self._ensure_session_is_active()
+            
             if not self.authenticated:
+                # This check remains as a final safety net
+                logger.error("IG provider is not authenticated. Cannot get price.")
                 return None
             
             symbol_data = await self._lookup_symbol_in_db(ticker)

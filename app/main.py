@@ -20,6 +20,8 @@ from datetime import datetime
 from typing import List, Dict, Any
 import logging
 import asyncio
+import faulthandler
+import signal
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 # Global aggregator instance
 aggregator = DataAggregator()
+
+faulthandler.register(signal.SIGUSR1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
