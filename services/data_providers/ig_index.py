@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any # Added Any
 from datetime import datetime
 from app.models import PriceData, AssetType
 from config.settings import settings
+from requests.exceptions import HTTPError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -79,17 +80,22 @@ class IGIndexProvider:
             # This is a reliable way to confirm the session is still active.
             await asyncio.to_thread(self.ig_service.fetch_accounts)
             
+        except HTTPError as e:
+            # Specifically catch HTTP errors like 403
+            if e.response.status_code == 403:
+                logger.warning(f"IG session check returned 403 Forbidden. Assuming rate-limit or stale session. Re-authenticating...")
+                self.authenticated = False
+                await self.initialize()
+            else:
+                # Re-raise other HTTP errors
+                raise e
         except Exception as e:
-            # Catch the generic Exception and inspect the message
             error_message = str(e).lower()
-            
-            # Check for keywords that indicate a stale session
             if "security" in error_message or "token" in error_message:
                 logger.warning(f"IG session appears stale ({e}). Re-authenticating...")
                 self.authenticated = False
-                await self.initialize() # Attempt to establish a fresh session
+                await self.initialize()
             else:
-                # If it's a different, unexpected error, raise it
                 logger.error(f"Unexpected error checking IG session status: {e}")
                 raise e
     

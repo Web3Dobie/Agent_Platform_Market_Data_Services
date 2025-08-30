@@ -25,9 +25,11 @@ class DataAggregator:
             'binance': BinanceProvider(),
             'mexc': MEXCProvider(),
             'ig_index': IGIndexProvider(),
-            'finnhub': FinnhubProvider(),  # NEW - News and calendar data
+            'finnhub': FinnhubProvider(),
         }
-        
+
+        self._ig_lock = asyncio.Lock()
+
         # Track initialization and health status
         self._initialized = False
         self._provider_ready = {
@@ -350,58 +352,85 @@ class DataAggregator:
 
     # In services/aggregator.py
 
+    # Ensure you have this lock in your DataAggregator's __init__ method
+    # self._ig_lock = asyncio.Lock()
+
     async def get_bulk_prices(self, symbols: List[str]) -> Dict[str, Any]:
         """
-        Fetches bulk prices with correct provider routing and matches the
-        BulkPriceResponse Pydantic model.
+        Fetches bulk prices with a robust, rate-limited, and concurrent-safe approach.
         """
         logger.info(f"Fetching bulk prices for {len(symbols)} symbols.")
         
+        # --- 1. Separate symbols by provider type ---
         ig_symbols = []
         other_symbols = []
         for symbol in symbols:
             asset_type = self._detect_asset_type(symbol)
-            provider_list = self._get_providers_for_symbol(symbol, asset_type)
-            if provider_list and provider_list[0] == 'ig_index':
+            # Assumes the first provider in the priority list is the primary one
+            primary_provider = self._get_providers_for_symbol(symbol, asset_type)[0]
+            if primary_provider == 'ig_index':
                 ig_symbols.append(symbol)
             else:
                 other_symbols.append(symbol)
 
         all_prices = []
-        failed_symbols = []  # +++ FIX: Initialize the list here
-
+        failed_symbols_list = [] # Use a temporary list for failures
+        
+        # --- 2. Process non-IG providers concurrently ---
         if other_symbols:
             logger.info(f"Processing {len(other_symbols)} symbols concurrently (non-IG).")
             tasks = [self.get_price(symbol) for symbol in other_symbols]
-            results = await asyncio.gather(*tasks)
-            all_prices.extend([p for p in results if p])
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, PriceData):
+                    all_prices.append(result)
+                else:
+                    failed_symbols_list.append(other_symbols[i])
 
+        # --- 3. Process IG provider symbols sequentially and safely ---
         if ig_symbols:
-            logger.info(f"Processing {len(ig_symbols)} symbols sequentially for IG provider.")
-            ig_provider = self.providers.get('ig_index')
-            
-            if ig_provider and self._provider_ready.get('ig_index'):
-                for symbol in ig_symbols:
-                    await asyncio.sleep(0.5) 
-                    price_data = await self.get_price_with_retry(symbol, max_retries=1)
-                    if price_data:
-                        all_prices.append(price_data)
-                    else:
-                        failed_symbols.append(symbol)
-            else:
-                logger.error("IG provider not ready. Skipping all IG symbols.")
-                failed_symbols.extend(ig_symbols)
+            # Use the lock to ensure only one task processes IG symbols at a time
+            async with self._ig_lock:
+                logger.info(f"Acquired lock for processing {len(ig_symbols)} IG symbols.")
+                ig_provider = self.providers.get('ig_index')
 
+                if ig_provider and self._provider_ready.get('ig_index'):
+                    await ig_provider._ensure_session_is_active()
+
+                    # Batching and backoff configuration
+                    batch_size = 5
+                    backoff_delay = 10
+                    
+                    for i, symbol in enumerate(ig_symbols):
+                        # Back off between batches
+                        if i > 0 and i % batch_size == 0:
+                            logger.info(f"Completed a batch of {batch_size}. Backing off for {backoff_delay} seconds...")
+                            await asyncio.sleep(backoff_delay)
+
+                        # Per-symbol delay to be a good API citizen
+                        await asyncio.sleep(2)
+                        
+                        price_data = await self.get_price_with_retry(symbol, max_retries=1)
+                        
+                        if price_data:
+                            all_prices.append(price_data)
+                        else:
+                            failed_symbols_list.append(symbol)
+                else:
+                    logger.warning("IG provider not ready, skipping all IG symbols.")
+                    failed_symbols_list.extend(ig_symbols)
+
+        # --- 4. Compile and return the final response ---
         successful_symbols_set = {p.symbol for p in all_prices}
-        failed_symbols = [s for s in symbols if s not in successful_symbols_set]
+        final_failed_symbols = [s for s in symbols if s not in successful_symbols_set]
         
         logger.info(f"Bulk request complete: {len(all_prices)}/{len(symbols)} successful.")
-        if failed_symbols:
-            logger.warning(f"Failed symbols: {failed_symbols}")
+        if final_failed_symbols:
+            logger.warning(f"Failed symbols: {final_failed_symbols}")
             
         return {
             "data": all_prices,
-            "failed_symbols": failed_symbols,
+            "failed_symbols": final_failed_symbols,
             "timestamp": datetime.utcnow()
         }
 
