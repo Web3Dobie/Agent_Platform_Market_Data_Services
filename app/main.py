@@ -86,6 +86,18 @@ async def heartbeat_background_task():
     while True:
         try:
             await asyncio.sleep(1800)  # 30 minutes
+
+            # --- PROACTIVELY REFRESH IG SESSION ---
+            # This is the new, proactive step to prevent timeouts.
+            try:
+                logger.info("❤️‍🩹 [Heartbeat] Proactively checking IG session...")
+                ig_provider = aggregator.providers.get('ig_index')
+                if ig_provider and hasattr(ig_provider, '_ensure_session_is_active'):
+                    await ig_provider._ensure_session_is_active()
+                    logger.info("❤️‍🩹 [Heartbeat] IG session check complete.")
+            except Exception as e:
+                # Don't let a failed IG refresh stop the whole heartbeat
+                logger.error(f"❤️‍🩹 [Heartbeat] Error during proactive IG refresh: {e}")
             
             # Check system health
             services = await aggregator.health_check()

@@ -309,7 +309,7 @@ class DataAggregator:
                 provider = self.providers[provider_name]
                 result = await asyncio.wait_for(
                     provider.get_price(symbol),
-                    timeout=15.0
+                    timeout=30.0
                 )
                 
                 if result and hasattr(result, 'price') and result.price > 0:

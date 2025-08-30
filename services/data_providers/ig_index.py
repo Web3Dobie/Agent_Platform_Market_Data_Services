@@ -24,10 +24,74 @@ class IGIndexProvider:
     def __init__(self):
         self.ig_service = None
         self.authenticated = False
-        
-        # --- REMOVED --- self.prefixes is no longer needed.
-        
-        logger.info("IG Index provider initialized with search-based discovery")
+        self._lock = asyncio.Lock() # Add a lock to prevent race conditions during re-authentication
+        logger.info("IG Index provider initialized with self-healing session logic.")
+    
+    async def initialize(self) -> bool:
+        """Connects and authenticates with IG Index using credentials from settings."""
+        async with self._lock:
+            # If we are already authenticated, do nothing.
+            if self.authenticated:
+                return True
+
+            logger.info("Attempting to establish IG Index session...")
+            try:
+                # Check if settings are configured
+                if not all([settings.ig_username, settings.ig_password, settings.ig_api_key]):
+                    logger.error("IG credentials not found in settings.py")
+                    return False
+                
+                # Explicitly create the IGService instance with your credentials
+                # This is your original, correct method that overrides the library's default behavior.
+                self.ig_service = IGService(
+                    username=settings.ig_username,
+                    password=settings.ig_password,
+                    api_key=settings.ig_api_key,
+                    acc_type=settings.ig_acc_type
+                )
+                
+                # Use to_thread for the synchronous library call
+                await asyncio.to_thread(self.ig_service.create_session)
+                
+                self.authenticated = True
+                logger.info(f"✅ IG Index session established successfully ({settings.ig_acc_type})")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ IG authentication failed: {e}")
+                self.authenticated = False
+                self.ig_service = None
+                return False
+
+    # --- NEW METHOD: Checks and refreshes the session if stale ---
+    async def _ensure_session_is_active(self):
+        """
+        Performs a cheap, lightweight check to see if the session is active.
+        If an authentication error occurs, it triggers a full re-initialization.
+        """
+        if not self.authenticated or not self.ig_service:
+            logger.warning("Session not authenticated, attempting to initialize.")
+            await self.initialize()
+            return
+
+        try:
+            # Make a cheap, non-blocking API call to fetch account details.
+            # This is a reliable way to confirm the session is still active.
+            await asyncio.to_thread(self.ig_service.fetch_accounts)
+            
+        except Exception as e:
+            # Catch the generic Exception and inspect the message
+            error_message = str(e).lower()
+            
+            # Check for keywords that indicate a stale session
+            if "security" in error_message or "token" in error_message:
+                logger.warning(f"IG session appears stale ({e}). Re-authenticating...")
+                self.authenticated = False
+                await self.initialize() # Attempt to establish a fresh session
+            else:
+                # If it's a different, unexpected error, raise it
+                logger.error(f"Unexpected error checking IG session status: {e}")
+                raise e
     
     # --- NO CHANGES to _get_db_params, _lookup_symbol_in_db, _save_discovered_symbol ---
     def _get_db_params(self) -> dict:
@@ -86,18 +150,19 @@ class IGIndexProvider:
         except Exception as e:
             logger.error(f"Failed to save {ticker} to database: {e}")
             return False
-    
-    # --- REMOVED --- _get_symbol_variations and _discover_epic are replaced by search.
 
     # --- NEW METHOD --- Implements the actual API search call.
     async def search_markets(self, search_term: str) -> List[Dict[str, Any]]:
         """
         Calls the IG API to search for markets matching the search_term.
-        It now correctly handles the Pandas DataFrame returned by the library.
         """
-        if not self.authenticated:
-            if not await self.authenticate():
-                return []
+        try:
+            await self._ensure_session_is_active()
+            if not self.authenticated:
+                return [] # Return empty list if session could not be established
+        except Exception as e:
+            logger.error(f"Failed to ensure IG session for market search: {e}")
+            return []
                 
         logger.info(f"IG: Searching for markets matching '{search_term}'")
         try:
@@ -175,8 +240,13 @@ class IGIndexProvider:
     # --- NO CHANGES to _get_market_metadata, _clean_instrument_name, or _infer_asset_type ---
     async def _get_market_metadata(self, epic: str) -> Optional[Dict]:
         """Get market metadata including display name from IG API"""
-        if not self.authenticated:
-            if not await self.authenticate(): return None
+        try:
+            await self._ensure_session_is_active()
+            if not self.authenticated:
+                return None
+        except Exception as e:
+            logger.error(f"Failed to ensure IG session for metadata: {e}")
+            return None
         try:
             await asyncio.sleep(0.5) # Reduced rate limit delay
             market_data = await asyncio.to_thread(self.ig_service.fetch_market_by_epic, epic)
@@ -229,33 +299,6 @@ class IGIndexProvider:
             return 'crypto'
         return 'stock'
 
-    async def initialize(self) -> bool:
-        """Connects and authenticates with IG Index. Should be called once."""
-        if self.authenticated:
-            return True # Already connected
-
-        try:
-            if not all([settings.ig_username, settings.ig_password, settings.ig_api_key]):
-                logger.error("IG credentials not configured")
-                return False
-            
-            config.username = settings.ig_username
-            config.password = settings.ig_password
-            config.api_key = settings.ig_api_key
-            config.acc_type = settings.ig_acc_type
-            
-            self.ig_service = IGService(config.username, config.password, config.api_key, config.acc_type)
-            
-            await asyncio.to_thread(self.ig_service.create_session)
-            self.authenticated = True
-            logger.info(f"IG Index session established ({config.acc_type})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"IG authentication failed: {e}")
-            self.authenticated = False
-            return False
-
     def _normalize_price(self, price: float, epic: str) -> float:
         """Normalize IG prices to standard format"""
         if epic.startswith(('UA.D.', 'UB.D.', 'UC.D.', 'UD.D.', 'UE.D.', 'UF.D.', 'UG.D.', 'UH.D.', 'UI.D.', 'UJ.D.', 'SH.D.', 'SA.D.', 'SB.D.', 'SC.D.', 'SD.D.', 'SE.D.', 'SF.D.', 'SG.D.', 'SI.D')) and epic.endswith('.DAILY.IP'):
@@ -264,73 +307,75 @@ class IGIndexProvider:
 
     # --- UPDATED get_price --- This method's logic remains the same, but it now calls the new discovery function.
     async def get_price(self, ticker: str) -> Optional[PriceData]:
-        """Get price for ticker - database-first approach with search-based discovery"""
-        if not self.authenticated:
-            is_ready = await self.initialize()
-            if not is_ready:
+        """Get price for ticker with self-healing session logic."""
+        try:
+            await self._ensure_session_is_active()
+            
+            if not self.authenticated:
                 logger.error("IG provider is not authenticated. Cannot get price.")
                 return None
-        
-        ticker = ticker.upper()
-        symbol_data = self._lookup_symbol_in_db(ticker)
-        
-        if not symbol_data:
-            symbol_data = await self._discover_and_enhance_symbol(ticker)
+            
+            ticker = ticker.upper()
+            symbol_data = self._lookup_symbol_in_db(ticker)
+            
             if not symbol_data:
-                logger.warning(f"Could not find or discover {ticker}")
-                return None
-        
-        epic = symbol_data['epic']
-        if not epic:
-            logger.warning(f"No EPIC available for {ticker}")
-            return None
-        
-        try:
-            market_data = await asyncio.to_thread(self.ig_service.fetch_market_by_epic, epic)
+                symbol_data = await self._discover_and_enhance_symbol(ticker)
+                if not symbol_data:
+                    logger.warning(f"Could not find or discover {ticker}")
+                    return None
             
-            if not market_data or 'snapshot' not in market_data:
-                logger.warning(f"No data for {ticker} ({epic})")
+            epic = symbol_data['epic']
+            if not epic:
+                logger.warning(f"No EPIC available for {ticker}")
                 return None
             
-            snapshot = market_data['snapshot']
-            
-            # --- ROBUST PRICE PARSING ---
-            bid_price = snapshot.get('bid')
-            offer_price = snapshot.get('offer')
+            # This nested try/except is for the specific API call
+            try:
+                market_data = await asyncio.to_thread(self.ig_service.fetch_market_by_epic, epic)
+                
+                if not market_data or 'snapshot' not in market_data:
+                    logger.warning(f"No data for {ticker} ({epic})")
+                    return None
+                
+                snapshot = market_data['snapshot']
+                
+                bid_price = snapshot.get('bid')
+                offer_price = snapshot.get('offer')
 
-            # Use the first valid price available, otherwise default to 0.0
-            raw_price = 0.0
-            if bid_price is not None:
-                raw_price = float(bid_price)
-            elif offer_price is not None:
-                raw_price = float(offer_price)
-            # --- END OF FIX ---
-            
-            if raw_price == 0:
-                logger.warning(f"Zero or None price for {ticker} ({epic})")
+                raw_price = 0.0
+                if bid_price is not None:
+                    raw_price = float(bid_price)
+                elif offer_price is not None:
+                    raw_price = float(offer_price)
+                
+                if raw_price == 0:
+                    logger.warning(f"Zero or None price for {ticker} ({epic})")
+                    return None
+                
+                price = self._normalize_price(raw_price, epic)
+                
+                change_percent = float(snapshot.get('percentageChange') or 0.0)
+                change_absolute = float(snapshot.get('netChange') or 0.0)
+                
+                if epic.startswith(('UA.D.', 'UB.D.', 'UC.D.', 'UD.D.', 'UE.D.', 'UF.D.', 'UG.D.', 'UH.D.', 'UI.D.', 'UJ.D.', 'SH.D.', 'SA.D.', 'SB.D.', 'SC.D.', 'SD.D.', 'SE.D.', 'SF.D.', 'SG.D.')):
+                    change_absolute = change_absolute / 100
+                
+                asset_type_str = symbol_data.get('asset_type', 'stock')
+                asset_type = AssetType(asset_type_str) if asset_type_str in AssetType.__members__ else AssetType.EQUITY
+                
+                return PriceData(
+                    symbol=ticker, asset_type=asset_type, price=price,
+                    change_percent=change_percent, change_absolute=change_absolute,
+                    volume=None, timestamp=datetime.utcnow(), source="ig_index"
+                )
+                
+            except Exception as e:
+                logger.error(f"IG API error for {ticker}: {e}")
                 return None
-            
-            price = self._normalize_price(raw_price, epic)
-            
-            # Handle potentially None change values as well
-            change_percent = float(snapshot.get('percentageChange') or 0.0)
-            change_absolute = float(snapshot.get('netChange') or 0.0)
-            
-            if epic.startswith(('UA.D.', 'UB.D.', 'UC.D.', 'UD.D.', 'UE.D.', 'UF.D.', 'UG.D.', 'UH.D.', 'UI.D.', 'UJ.D.', 'SH.D.', 'SA.D.', 'SB.D.', 'SC.D.', 'SD.D.', 'SE.D.', 'SF.D.', 'SG.D.')):
-                change_absolute = change_absolute / 100
-            
-            # Use the asset_type from the database
-            asset_type_str = symbol_data.get('asset_type', 'stock')
-            asset_type = AssetType(asset_type_str) if asset_type_str in AssetType.__members__ else AssetType.EQUITY
-            
-            return PriceData(
-                symbol=ticker, asset_type=asset_type, price=price,
-                change_percent=change_percent, change_absolute=change_absolute,
-                volume=None, timestamp=datetime.utcnow(), source="ig_index"
-            )
-            
+                
+        # This is the outer except block for the whole function
         except Exception as e:
-            logger.error(f"IG API error for {ticker}: {e}")
+            logger.error(f"An unexpected error occurred in get_price for {ticker}: {e}")
             return None
             
     # --- NO CHANGES to get_bulk_prices, can_handle_symbol, or health_check ---
@@ -359,16 +404,16 @@ class IGIndexProvider:
         return True
 
     async def health_check(self) -> bool:
-        """Check if IG API and database are working."""
+        """Check if the provider believes it's authenticated and the DB is reachable."""
+        db_ok = False
         try:
             with psycopg2.connect(**self._get_db_params()) as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT 1;")
-            
-            if not self.authenticated:
-                return await self.authenticate()
-            return True
-            
+            db_ok = True
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
+            logger.error(f"Health check failed to connect to DB: {e}")
+            db_ok = False
+        
+        # Return True only if both the DB is reachable and the session is marked as active
+        return self.authenticated and db_ok
