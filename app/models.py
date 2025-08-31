@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
 
@@ -47,3 +47,17 @@ class MarketMoversResponse(BaseModel):
     gainers: List[dict]
     losers: List[dict]
     timestamp: datetime
+
+class MacroDataPoint(BaseModel):
+    date: str
+    value: float
+
+class MacroDataResponse(BaseModel):
+    name: str
+    series_id: str
+    latest_value: float
+    latest_date: str
+    change_from_previous: float
+    percent_change_from_previous: float
+    percent_change_year_ago: Optional[float] = None
+    history: List[MacroDataPoint]

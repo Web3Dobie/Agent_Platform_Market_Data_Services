@@ -1,71 +1,68 @@
-import redis.asyncio as redis
+# services/cache_service.py - Corrected with generic, synchronous logic
+
+import redis # Use the synchronous library
 import json
 import logging
 from typing import Optional, Any
-from datetime import datetime, timedelta
 from config.settings import settings
-from app.models import PriceData, AssetType
 
 logger = logging.getLogger(__name__)
 
 class CacheService:
     def __init__(self):
         self.redis = None
-    
-    async def connect(self):
-        """Initialize Redis connection"""
+        self.connect() # Connect immediately on initialization
+
+    def connect(self):
+        """Initialize Redis connection synchronously."""
+        if self.redis:
+            return
         try:
+            # Use the standard synchronous from_url
             self.redis = redis.from_url(
                 settings.redis_url,
                 encoding="utf-8",
-                decode_responses=True
+                decode_responses=True # This is important
             )
-            await self.redis.ping()
-            logger.info("✅ Redis connection established")
+            self.redis.ping()
+            logger.info("✅ Synchronous Redis connection established")
         except Exception as e:
             logger.error(f"❌ Redis connection failed: {e}")
             self.redis = None
-    
-    async def get(self, key: str) -> Optional[PriceData]:
-        """Get cached price data"""
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get any JSON-serializable data from the cache."""
         if not self.redis:
             return None
         
         try:
-            data = await self.redis.get(key)
+            data = self.redis.get(key)
             if data:
-                parsed = json.loads(data)
-                return PriceData(**parsed)
+                # Return the parsed JSON data (e.g., a dictionary)
+                return json.loads(data)
         except Exception as e:
             logger.error(f"Cache get error for {key}: {e}")
         
         return None
-    
-    async def set(self, key: str, price_data: PriceData, ttl: int):
-        """Cache price data with TTL"""
+
+    def set(self, key: str, value: Any, ttl: int):
+        """Cache any JSON-serializable data with TTL."""
         if not self.redis:
             return
         
         try:
-            data = price_data.model_dump_json()
-            await self.redis.setex(key, ttl, data)
+            # Convert the value (e.g., a dictionary) to a JSON string
+            data_to_cache = json.dumps(value)
+            self.redis.setex(key, ttl, data_to_cache)
         except Exception as e:
             logger.error(f"Cache set error for {key}: {e}")
-    
-    def get_ttl_for_asset(self, asset_type: AssetType) -> int:
-        """Get appropriate TTL based on asset type"""
-        if asset_type == AssetType.CRYPTO:
-            return settings.crypto_cache_ttl
-        else:
-            return settings.traditional_cache_ttl
-    
-    async def health_check(self) -> bool:
-        """Check if Redis is healthy"""
+
+    def health_check(self) -> bool:
+        """Check if Redis is healthy."""
         if not self.redis:
             return False
-        
         try:
-            await self.redis.ping()
+            self.redis.ping()
             return True
-        except:
+        except Exception:
             return False

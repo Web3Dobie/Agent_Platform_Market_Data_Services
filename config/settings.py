@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     
     # Other API Keys
     finnhub_api_key: Optional[str] = None
-    
+    fred_api_key: Optional[str] = None
+
     # Telegram Configuration
     tg_bot_token: Optional[str] = None
     tg_chat_id: Optional[str] = None
@@ -31,6 +32,7 @@ class Settings(BaseSettings):
     crypto_cache_ttl: int = 60      # 1 minute for crypto
     traditional_cache_ttl: int = 300 # 5 minutes for traditional assets
     news_cache_ttl: int = 900       # 15 minutes for news
+    macro_cache_ttl: int = 86400     # 1 day for macro data
 
     class Config:
         env_file = ".env"

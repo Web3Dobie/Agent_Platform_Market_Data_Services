@@ -2,13 +2,14 @@
 """
 Production Market Data Service with enhanced but safe Telegram integration
 """
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.models import HealthResponse
-from app.routers import prices, metadata, news, markets
+from app.routers import prices, metadata, news, markets, macro
 from services.aggregator import DataAggregator
 from services.data_providers.finnhub import FinnhubProvider
+from services.data_providers.fred_service import FredService
 from services.telegram_notifier import (
     get_notifier, 
     notify_startup, 
@@ -16,7 +17,7 @@ from services.telegram_notifier import (
     notify_health_issue
 )
 from config.settings import settings
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 from typing import List, Dict, Any
 import logging
 import asyncio
@@ -36,54 +37,92 @@ aggregator = DataAggregator()
 
 faulthandler.register(signal.SIGUSR1)
 
+
+async def schedule_fred_cache_warmup():
+    """
+    A background task that runs once per day at a specific time (16:00 UTC)
+    to refresh the FRED data cache.
+    """
+    await app.router.startup() # Wait for the main app startup to complete
+    fred_provider = aggregator.providers.get('fred')
+    
+    if not fred_provider:
+        logger.error("FRED provider not found for scheduled cache warmup.")
+        return
+
+    series_to_warm = ["GDP", "CPIAUCSL", "UNRATE", "FEDFUNDS", "NAPM"]
+    logger.info("FRED cache scheduler started. Waiting for the first run at 16:00 UTC.")
+
+    while True:
+        # 1. Calculate the time until the next 16:00 UTC
+        now_utc = datetime.now(timezone.utc)
+        target_time_utc = time(16, 0, tzinfo=timezone.utc)
+        
+        # Determine the datetime for the next run
+        next_run_utc = datetime.combine(now_utc.date(), target_time_utc)
+        if now_utc > next_run_utc:
+            # If 4 PM has already passed for today, schedule it for tomorrow
+            next_run_utc += timedelta(days=1)
+            
+        # 2. Calculate the delay in seconds and wait
+        delay_seconds = (next_run_utc - now_utc).total_seconds()
+        logger.info(f"Scheduler waiting {delay_seconds / 3600:.2f} hours until next run at 16:00 UTC.")
+        await asyncio.sleep(delay_seconds)
+
+        # 3. Once awake, run the cache refresh task
+        logger.info("It's 16:00 UTC! Running daily FRED cache refresh...")
+        for series_id in series_to_warm:
+            try:
+                fred_provider.get_series_data(series_id, f"Warmup for {series_id}")
+                logger.info(f"Successfully warmed cache for FRED series: {series_id}")
+                await asyncio.sleep(5) # Stagger requests
+            except Exception as e:
+                logger.error(f"Failed to warm cache for FRED series {series_id}: {e}")
+        
+        logger.info("Daily FRED cache refresh complete.")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting Market Data Service...")
+    # --- Store task handles outside the try block ---
+    fred_task = None
+    heartbeat_task = None
     
     try:
-        # Initialize aggregator
+        # --- Startup ---
+        logger.info("Starting Market Data Service...")
         await aggregator.initialize()
         logger.info("Market Data Service initialized")
+
+        # --- Start and store ALL background tasks ---
+        fred_task = asyncio.create_task(schedule_fred_cache_warmup())
+        heartbeat_task = asyncio.create_task(heartbeat_background_task())
+        logger.info("Background tasks (FRED Cache, Heartbeat) started.")
         
-        # Get provider list with improved error handling
-        providers = []
-        try:
-            if hasattr(aggregator, 'providers') and aggregator.providers:
-                providers = list(aggregator.providers.keys())
-            else:
-                # Fallback provider list
-                providers = ['binance', 'yahoo', 'ig_index', 'mexc']
-                logger.warning("Using fallback provider list")
-        except Exception as e:
-            logger.error(f"Error getting provider list: {e}")
-            providers = ['unknown']
+        # --- Get the *actual* list of ready providers ---
+        ready_providers = aggregator.get_ready_providers() # We'll add this helper method
         
         # Send enhanced startup notification
-        startup_success = notify_startup(settings.host, settings.port, providers)
-        if startup_success:
-            logger.info("Enhanced startup notification sent successfully")
-        else:
-            logger.warning("Startup notification failed - continuing anyway")
+        notify_startup(settings.host, settings.port, ready_providers)
         
-        # Start background heartbeat task
-        heartbeat_task = asyncio.create_task(heartbeat_background_task())
-        logger.info("Heartbeat task started")
+        yield # The application is now running
+    
+    finally:
+        # --- Shutdown ---
+        logger.info("Shutting down Market Data Service...")
+        # --- Cancel *both* tasks safely ---
+        if fred_task:
+            fred_task.cancel()
+            try:
+                await fred_task
+            except asyncio.CancelledError:
+                logger.info("FRED cache scheduler successfully cancelled.")
         
-    except Exception as e:
-        logger.error(f"Failed to start Market Data Service: {e}")
-        notify_error("Service Startup", str(e))
-        raise
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down Market Data Service...")
-    try:
-        heartbeat_task.cancel()
-        await heartbeat_task
-    except:
-        pass
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                logger.info("Heartbeat task successfully cancelled.")
 
 async def heartbeat_background_task():
     """Background heartbeat task with enhanced monitoring"""
@@ -146,6 +185,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """
+    This middleware will log the method and path of every incoming request.
+    """
+    logger.info(f"INCOMING REQUEST: Method={request.method}, Path={request.url.path}")
+    response = await call_next(request)
+    return response
+
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -163,16 +212,21 @@ app.include_router(prices.router, prefix="/api/v1")
 app.include_router(metadata.router, prefix="/api/v1")
 app.include_router(news.router, prefix="/api/v1")
 app.include_router(markets.router, prefix="/api/v1")
+app.include_router(macro.router, prefix="/api/v1")
 
 # Get the initialized finnhub instance from the aggregator
 def get_initialized_finnhub() -> FinnhubProvider:
     return aggregator.providers['finnhub']
+
+def get_initialized_fred() -> FredService:
+    return aggregator.providers['fred']
 
 # Override the dependency AFTER including the routers
 app.dependency_overrides[prices.get_aggregator] = get_aggregator
 app.dependency_overrides[metadata.get_aggregator] = get_aggregator
 app.dependency_overrides[news.get_finnhub] = get_initialized_finnhub
 app.dependency_overrides[markets.get_aggregator] = get_aggregator
+app.dependency_overrides[macro.get_fred_service] = get_initialized_fred
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -242,6 +296,8 @@ async def root():
             "market_news": "/api/v1/news/market",
             "ipo_calendar": "/api/v1/calendar/ipo",
             "earnings_calendar": "/api/v1/calendar/earnings",
+            "macro_data": "/api/v1/macro/{series_name}",
+            "macro_cache_warmup": "/api/v1/macro/warm-cache",
             "telegram_status": "/telegram/status",
             "telegram_test": "/telegram/test"
         }

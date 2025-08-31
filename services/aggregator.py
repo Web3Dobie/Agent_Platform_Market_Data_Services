@@ -10,6 +10,7 @@ from .data_providers.binance import BinanceProvider
 from .data_providers.mexc import MEXCProvider  
 from .data_providers.ig_index import IGIndexProvider
 from .data_providers.finnhub import FinnhubProvider
+from .data_providers.fred_service import FredService
 from app.models import PriceData, AssetType
 
 logger = logging.getLogger(__name__)
@@ -26,9 +27,8 @@ class DataAggregator:
             'mexc': MEXCProvider(),
             'ig_index': IGIndexProvider(),
             'finnhub': FinnhubProvider(),
+            'fred': FredService(),
         }
-
-        self._ig_lock = asyncio.Lock()
 
         # Track initialization and health status
         self._initialized = False
@@ -37,6 +37,7 @@ class DataAggregator:
             'mexc': False, 
             'ig_index': False,
             'finnhub': False,
+            'fred': False,
         }
         
         # Provider priority for price data (Finnhub doesn't provide prices)
@@ -48,6 +49,8 @@ class DataAggregator:
             AssetType.COMMODITY: ['ig_index']
         }
         
+        self._ig_lock = asyncio.Lock()
+
         # Request statistics for monitoring
         self._request_stats = {
             'total_requests': 0,
@@ -57,115 +60,76 @@ class DataAggregator:
         }
         
         logger.info("Data Aggregator initialized with enhanced reliability and Finnhub news")
-        logger.info("Providers: Binance, MEXC, IG Index (prices) + Finnhub (news/calendar)")
+        logger.info("Providers: Binance, MEXC, IG Index (prices) + Finnhub (news/calendar) + FRED (macro)")
     
     async def initialize(self):
-        """
-        Enhanced provider initialization with better error handling and parallel processing
-        """
-        logger.info("Starting enhanced provider initialization...")
-        
-        initialization_results = {}
-        initialization_tasks = []
-        
-        # Create initialization tasks for parallel execution
-        for name, provider in self.providers.items():
-            task = self._initialize_provider(name, provider)
-            initialization_tasks.append(task)
-        
-        # Execute all initializations in parallel with timeout
+        logger.info("Starting provider initialization...")
+        initialization_tasks = [self._initialize_provider(name, provider) for name, provider in self.providers.items()]
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*initialization_tasks, return_exceptions=True),
-                timeout=60.0  # 60 second total timeout for all providers
-            )
-            
-            # Process results
-            for i, (name, provider) in enumerate(self.providers.items()):
-                result = results[i]
-                if isinstance(result, Exception):
-                    logger.error(f"Provider {name} initialization failed: {result}")
-                    initialization_results[name] = f"error: {str(result)}"
-                else:
-                    initialization_results[name] = result
-                    
+            await asyncio.wait_for(asyncio.gather(*initialization_tasks, return_exceptions=True), timeout=60.0)
         except asyncio.TimeoutError:
-            logger.error("Provider initialization timed out after 60 seconds")
-            for name in self.providers.keys():
-                if name not in initialization_results:
-                    initialization_results[name] = "timeout"
-        
-        # Mark as initialized regardless of individual provider status
+            logger.error("Provider initialization timed out.")
+
         self._initialized = True
-        
-        # Log comprehensive summary
         ready_providers = [name for name, ready in self._provider_ready.items() if ready]
         failed_providers = [name for name, ready in self._provider_ready.items() if not ready]
-        
         logger.info("Provider initialization complete:")
         logger.info(f"  Ready providers: {ready_providers}")
-        
         if failed_providers:
             logger.warning(f"  Failed providers: {failed_providers}")
-            logger.info("Service will continue with available providers")
         
-        # Log provider capabilities
-        price_providers = [p for p in ready_providers if p != 'finnhub']
+        price_providers = [p for p in ready_providers if p not in ['finnhub', 'fred']]
         news_available = 'finnhub' in ready_providers
-        
+        macro_available = 'fred' in ready_providers
         logger.info(f"  Price data: {len(price_providers)} providers available")
         logger.info(f"  News data: {'Available' if news_available else 'Not available'}")
-        
-        return initialization_results
+        logger.info(f"  Macro data: {'Available' if macro_available else 'Not available'}")
+
     
-    async def _initialize_provider(self, name: str, provider) -> str:
-        """Initialize a single provider with comprehensive testing"""
-        logger.debug(f"Initializing {name} provider...")
-        
+    async def _initialize_provider(self, name: str, provider):
         try:
-            # Step 1: Run provider's initialize method if available
             if hasattr(provider, 'initialize'):
-                init_result = await provider.initialize()
-                if init_result is False:  # Explicit False means initialization failed
-                    return "initialization_failed"
-                logger.debug(f"{name} initialize() completed")
-            
-            # Step 2: Health check
-            if hasattr(provider, 'health_check'):
-                health_result = await provider.health_check()
-                if not health_result:
-                    logger.warning(f"{name} health check failed")
-                    return "health_check_failed"
-                logger.debug(f"{name} health check passed")
-            
-            # Step 3: Functional test based on provider type
+                if await provider.initialize() is False:
+                    logger.warning(f"❌ {name} initialize() method returned False.")
+                    return # Stop initialization for this provider
+
+            if hasattr(provider, 'health_check') and not await provider.health_check():
+                logger.warning(f"{name} health check failed")
+                return
+
+            test_result = False
             if name == 'finnhub':
-                # Test news functionality
                 test_result = await self._test_news_provider(provider)
-                if test_result:
-                    self._provider_ready[name] = True
-                    logger.info(f"{name} news provider ready")
-                    return "ready"
-                else:
-                    logger.warning(f"{name} functional test failed")
-                    return "functional_test_failed"
+            elif name == 'fred':
+                # --- THIS IS THE FIX: The 'await' is removed ---
+                test_result = self._test_macro_provider(provider)
             else:
-                # Test price functionality for other providers
                 test_result = await self._test_price_provider(name, provider)
-                if test_result:
-                    self._provider_ready[name] = True
-                    logger.info(f"{name} price provider ready")
-                    return "ready"
-                else:
-                    logger.warning(f"{name} functional test failed")
-                    return "functional_test_failed"
-                    
-        except asyncio.TimeoutError:
-            logger.error(f"{name} initialization timed out")
-            return "timeout"
+
+            if test_result:
+                self._provider_ready[name] = True
+                logger.info(f"{name} provider ready")
+            else:
+                logger.warning(f"{name} functional test failed")
+
         except Exception as e:
-            logger.error(f"{name} initialization error: {e}")
-            return f"error: {str(e)}"
+            logger.error(f"{name} initialization error: {e}", exc_info=True)
+
+    def _test_macro_provider(self, provider) -> bool:
+        """Test FredService with a simple request for a major series."""
+        try:
+            # Use a synchronous call now
+            result = provider.get_series_data("GDP", "Gross Domestic Product")
+            
+            if result and isinstance(result, dict) and result.get('latest_value'):
+                logger.debug(f"FRED test successful: GDP = {result['latest_value']:.2f}")
+                return True
+            else:
+                logger.debug("FRED test returned invalid data")
+                return False
+        except Exception as e:
+            logger.debug(f"FRED test failed: {e}")
+            return False
     
     async def _test_price_provider(self, name: str, provider) -> bool:
         """Test price provider with a simple request"""
@@ -196,7 +160,7 @@ class DataAggregator:
             logger.debug(f"{name} test timed out")
             return False
         except Exception as e:
-            logger.debug(f"{name} test failed: {e}")
+            logger.error(f"Price provider test for '{name}' failed: {e}", exc_info=True)
             return False
     
     async def _test_news_provider(self, provider) -> bool:
@@ -219,7 +183,7 @@ class DataAggregator:
             logger.debug("Finnhub test timed out")
             return False
         except Exception as e:
-            logger.debug(f"Finnhub test failed: {e}")
+            logger.error(f"News provider test for 'finnhub' failed: {e}", exc_info=True)
             return False
     
     async def health_check(self) -> Dict[str, bool]:
@@ -290,12 +254,11 @@ class DataAggregator:
     # PRICE DATA METHODS (Enhanced)
     # =============================================================================
     
-    async def get_price(self, symbol: str) -> Optional[PriceData]:
+    async def get_price(self, symbol: str, ensure_session: bool = True) -> Optional[PriceData]:
         """
-        Get single price with enhanced error handling and statistics tracking
+        Fetches a single price, intelligently passing provider-specific arguments.
         """
         self._request_stats['total_requests'] += 1
-        
         asset_type = self._detect_asset_type(symbol)
         providers = self._get_providers_for_symbol(symbol, asset_type)
         
@@ -306,19 +269,26 @@ class DataAggregator:
                 continue
             
             self._request_stats['provider_stats'][provider_name]['requests'] += 1
-            
             try:
                 provider = self.providers[provider_name]
-                result = await asyncio.wait_for(
-                    provider.get_price(symbol),
-                    timeout=30.0
-                )
+                
+                # --- THIS IS THE KEY FIX ---
+                # Only pass 'ensure_session' to the provider that understands it.
+                if provider_name == 'ig_index':
+                    result = await asyncio.wait_for(
+                        provider.get_price(symbol, ensure_session=ensure_session),
+                        timeout=30.0
+                    )
+                else:
+                    # All other providers have a simpler get_price method.
+                    result = await asyncio.wait_for(
+                        provider.get_price(symbol),
+                        timeout=30.0
+                    )
                 
                 if result and hasattr(result, 'price') and result.price > 0:
                     self._request_stats['successful_requests'] += 1
                     self._request_stats['provider_stats'][provider_name]['successes'] += 1
-                    
-                    logger.debug(f"Price for {symbol}: ${result.price:.2f} from {provider_name}")
                     return result
                     
             except asyncio.TimeoutError:
@@ -332,13 +302,14 @@ class DataAggregator:
         logger.warning(f"Failed to get price for {symbol} from all available providers")
         return None
     
-    async def get_price_with_retry(self, symbol: str, max_retries: int = 2, ensure_session: bool = True) -> Optional[Dict[str, Any]]:
+    async def get_price_with_retry(self, symbol: str, max_retries: int = 1, ensure_session: bool = True) -> Optional[PriceData]:
         """
         Wrapper to fetch a single price with a simple retry mechanism.
         """
         for attempt in range(max_retries):
             try:
-                price_data = await self.get_price(symbol)
+                # Pass the ensure_session flag down to get_price
+                price_data = await self.get_price(symbol, ensure_session=ensure_session)
                 if price_data:
                     return price_data
                 logger.warning(f"Attempt {attempt + 1} for {symbol} returned no data. Retrying...")
@@ -355,85 +326,74 @@ class DataAggregator:
     # Ensure you have this lock in your DataAggregator's __init__ method
     # self._ig_lock = asyncio.Lock()
 
-    async def get_bulk_prices(self, symbols: List[str]) -> Dict[str, Any]:
+    async def get_bulk_prices(self, symbols: List[str], force_reconnect: bool = False) -> Dict[str, Any]:
         """
-        Fetches bulk prices with a robust, rate-limited, and concurrent-safe approach.
+        Fetches bulk prices with a simple and reliable re-authentication strategy for IG.
         """
         logger.info(f"Fetching bulk prices for {len(symbols)} symbols.")
         
-        # --- 1. Separate symbols by provider type ---
-        ig_symbols = []
-        other_symbols = []
-        for symbol in symbols:
+        unique_symbols = sorted(list(set(symbols)))
+        ig_symbols, other_symbols = [], []
+        for symbol in unique_symbols:
             asset_type = self._detect_asset_type(symbol)
-            # Assumes the first provider in the priority list is the primary one
-            primary_provider = self._get_providers_for_symbol(symbol, asset_type)[0]
-            if primary_provider == 'ig_index':
+            provider_list = self._get_providers_for_symbol(symbol, asset_type)
+            if provider_list and provider_list[0] == 'ig_index':
                 ig_symbols.append(symbol)
             else:
                 other_symbols.append(symbol)
 
-        all_prices = []
-        failed_symbols_list = [] # Use a temporary list for failures
+        all_prices: List[PriceData] = []
         
-        # --- 2. Process non-IG providers concurrently ---
+        # Process non-IG providers concurrently
         if other_symbols:
             logger.info(f"Processing {len(other_symbols)} symbols concurrently (non-IG).")
             tasks = [self.get_price(symbol) for symbol in other_symbols]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, result in enumerate(results):
-                if isinstance(result, PriceData):
-                    all_prices.append(result)
-                else:
-                    failed_symbols_list.append(other_symbols[i])
+            all_prices.extend([p for p in results if isinstance(p, PriceData)])
 
-        # --- 3. Process IG provider symbols sequentially and safely ---
+        # Process IG provider symbols sequentially and safely
         if ig_symbols:
-            # Use the lock to ensure only one task processes IG symbols at a time
-            async with self._ig_lock:
-                logger.info(f"Acquired lock for processing {len(ig_symbols)} IG symbols.")
-                ig_provider = self.providers.get('ig_index')
+            try:
+                async with asyncio.timeout(120):
+                    async with self._ig_lock:
+                        logger.info(f"Acquired lock for processing {len(ig_symbols)} IG symbols.")
+                        ig_provider = self.providers.get('ig_index')
 
-                if ig_provider and self._provider_ready.get('ig_index'):
-                    await ig_provider._ensure_session_is_active()
+                        if ig_provider:  # This needs to be indented to be inside the lock
+                            # --- SIMPLE & RELIABLE STRATEGY ---
+                            # 1. Always ensure a fresh session for each batch.
+                            logger.info("Forcing fresh IG session for this batch...")
+                            await ig_provider.initialize(force_reconnect=True)
 
-                    # Batching and backoff configuration
-                    batch_size = 5
-                    backoff_delay = 10
-                    
-                    for i, symbol in enumerate(ig_symbols):
-                        # Back off between batches
-                        if i > 0 and i % batch_size == 0:
-                            logger.info(f"Completed a batch of {batch_size}. Backing off for {backoff_delay} seconds...")
-                            await asyncio.sleep(backoff_delay)
+                            if ig_provider.authenticated:
+                                for i, symbol in enumerate(ig_symbols):
+                                    if i > 0 and i % 5 == 0:
+                                        logger.info(f"Completed a batch of 5. Backing off for 10 seconds...")
+                                        await asyncio.sleep(10)
+                                    
+                                    await asyncio.sleep(2)
+                                    price_data = await self.get_price_with_retry(symbol, max_retries=1)
+                                    if price_data:
+                                        all_prices.append(price_data)
+                            else:
+                                logger.error("Failed to establish fresh IG session. Skipping all IG symbols.")
+            except asyncio.TimeoutError:
+                logger.error("Bulk operation timed out - releasing lock")
 
-                        # Per-symbol delay to be a good API citizen
-                        await asyncio.sleep(2)
-                        
-                        price_data = await self.get_price_with_retry(symbol, max_retries=1)
-                        
-                        if price_data:
-                            all_prices.append(price_data)
-                        else:
-                            failed_symbols_list.append(symbol)
-                else:
-                    logger.warning("IG provider not ready, skipping all IG symbols.")
-                    failed_symbols_list.extend(ig_symbols)
+        # Compile and return the final response
+        price_map = {p.symbol: p for p in all_prices}
+        successful_symbols = set(price_map.keys())
+        failed_symbols = [s for s in unique_symbols if s not in successful_symbols]
 
-        # --- 4. Compile and return the final response ---
-        successful_symbols_set = {p.symbol for p in all_prices}
-        final_failed_symbols = [s for s in symbols if s not in successful_symbols_set]
-        
-        logger.info(f"Bulk request complete: {len(all_prices)}/{len(symbols)} successful.")
-        if final_failed_symbols:
-            logger.warning(f"Failed symbols: {final_failed_symbols}")
+        logger.info(f"Bulk request complete: {len(successful_symbols)}/{len(unique_symbols)} successful.")
+        if failed_symbols:
+            logger.warning(f"Failed symbols: {failed_symbols}")
             
         return {
-            "data": all_prices,
-            "failed_symbols": final_failed_symbols,
-            "timestamp": datetime.utcnow()
+            "data": [price_map[s].dict() for s in unique_symbols if s in successful_symbols],
+            "failed_symbols": failed_symbols,
+            "timestamp": datetime.utcnow().isoformat()
         }
-
     # EPIC discovery through markets endpoint
     #==============================================================================
 
@@ -625,3 +585,7 @@ class DataAggregator:
         
         # Default to equity
         return AssetType.EQUITY
+
+    def get_ready_providers(self) -> List[str]:
+        """Returns a list of providers that initialized successfully."""
+        return [name for name, ready in self._provider_ready.items() if ready]
