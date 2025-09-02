@@ -19,7 +19,7 @@ SERIES_MAP = {
     "gdp": ("GDP", "Real Gross Domestic Product"),
     "unemployment": ("UNRATE", "Unemployment Rate"),
     "fedfunds": ("FEDFUNDS", "Federal Funds Rate"),
-    "pmi": ("NAPM", "ISM Manufacturing PMI"),
+    "pmi": ("PMI", "ISM Manufacturing PMI"),
 }
 
 # --- THE STATIC PATH WITH THE FULL '/macro' PREFIX ---
@@ -32,7 +32,7 @@ async def warm_fred_cache(fred_service: FredService = Depends(get_fred_service))
     series_to_warm = {
         "GDP": "Gross Domestic Product", "CPIAUCSL": "Consumer Price Index",
         "UNRATE": "Unemployment Rate", "FEDFUNDS": "Federal Funds Rate",
-        "NAPM": "ISM Manufacturing PMI"
+        "PMI": "ISM Manufacturing PMI"
     }
     logger.info("Manual FRED cache warmup triggered...")
     warmed_series = []
