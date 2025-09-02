@@ -26,17 +26,31 @@ class FredService:
             return cached_data
 
         print(f"Cache MISS for FRED series: {series_id}. Fetching from API.")
-        # ... (rest of the API call and data processing logic is the same)
         today_str = datetime.now().strftime('%Y-%m-%d')
+        
+        # --- START OF FIX ---
+        
+        # Default parameters for most series
         params = {
             "series_id": series_id,
             "api_key": self.api_key,
             "file_type": "json",
             "sort_order": "desc",
             "limit": 25,
-            "realtime_start": today_str, # <-- Add this line
-            "realtime_end": today_str,   # <-- Add this line
+            "realtime_start": today_str,
+            "realtime_end": today_str,
         }
+
+        # Special handling for the problematic PMI series
+        is_pmi = (series_id == 'PMI')
+        if is_pmi:
+            # For PMI, we cannot use sort_order=desc. We fetch in ascending order.
+            params.pop("sort_order")
+            params.pop("limit")
+            # Fetch the last 2 years of data to ensure we get the latest
+            params["observation_start"] = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+        # --- END OF FIX ---
         try:
             response = requests.get(self.BASE_URL, params=params)
             response.raise_for_status()
@@ -45,6 +59,19 @@ class FredService:
             # ... (full data processing)
             observations = [obs for obs in data["observations"] if obs["value"] != "."]
             if len(observations) < 2: return None
+
+            # --- START OF FIX 2 ---
+            # If it was PMI, the latest is the LAST item, not the first
+            if is_pmi:
+                latest = observations[-1]
+                previous = observations[-2]
+                year_ago = observations[-13] if len(observations) > 12 else None
+            else: # Standard logic for all other series
+                latest = observations[0]
+                previous = observations[1]
+                year_ago = observations[12] if len(observations) > 12 else None
+            # --- END OF FIX 2 ---
+
             latest = observations[0]
             previous = observations[1]
             year_ago = observations[12] if len(observations) > 12 else None
