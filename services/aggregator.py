@@ -354,7 +354,7 @@ class DataAggregator:
         # Process IG provider symbols sequentially and safely
         if ig_symbols:
             try:
-                async with asyncio.timeout(120):
+                async with asyncio.timeout(900):
                     async with self._ig_lock:
                         logger.info(f"Acquired lock for processing {len(ig_symbols)} IG symbols.")
                         ig_provider = self.providers.get('ig_index')
