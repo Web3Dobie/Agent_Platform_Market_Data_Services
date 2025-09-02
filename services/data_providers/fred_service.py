@@ -27,14 +27,15 @@ class FredService:
 
         print(f"Cache MISS for FRED series: {series_id}. Fetching from API.")
         # ... (rest of the API call and data processing logic is the same)
-        start_date = (datetime.now() - timedelta(days=25 * 30)).strftime('%Y-%m-%d')
+        today_str = datetime.now().strftime('%Y-%m-%d')
         params = {
             "series_id": series_id,
             "api_key": self.api_key,
             "file_type": "json",
-            # "observation_start" has been removed
             "sort_order": "desc",
             "limit": 25,
+            "realtime_start": today_str, # <-- Add this line
+            "realtime_end": today_str,   # <-- Add this line
         }
         try:
             response = requests.get(self.BASE_URL, params=params)
