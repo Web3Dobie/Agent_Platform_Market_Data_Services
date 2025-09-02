@@ -188,7 +188,7 @@ class IGIndexProvider:
                 logger.warning(f"Zero or None price for {ticker} ({epic})")
                 return None
             
-            price = self._normalize_price(raw_price, epic)
+            price = self._normalize_price(raw_price, epic, ticker)
             change_percent = float(snapshot.get('percentageChange') or 0.0)
             change_absolute = float(snapshot.get('netChange') or 0.0)
             asset_type_str = symbol_data.get('asset_type', 'stock')
@@ -243,8 +243,31 @@ class IGIndexProvider:
             return 'crypto'
         return 'stock'
 
-    def _normalize_price(self, price: float, epic: str) -> float:
+    def _normalize_price(self, price: float, epic: str, symbol: str = None) -> float:
         """Normalize IG prices to standard format"""
+        
+        # Symbol-based normalization rules
+        symbol_rules = {
+            'CL=F': 100,    # Crude Oil
+            'BZ=F': 100,    # Brent Oil  
+            'SI=F': 100,    # Silver
+            'HG=F': 10000,  # Copper
+            # FX pairs
+            'EURUSD': 100,
+            'GBPUSD': 100,
+            'USDJPY': 100,
+            'AUDUSD': 100,
+            'USDCAD': 100,
+            'USDCHF': 100,
+            'EURGBP': 100,
+        }
+        
+        # Check symbol-based rules first
+        if symbol and symbol in symbol_rules:
+            return price / symbol_rules[symbol]
+        
+        # Fallback to existing EPIC-based FX logic for symbols not in our rules
         if epic.startswith(('UA.D.', 'UB.D.', 'UC.D.', 'UD.D.', 'UE.D.', 'UF.D.', 'UG.D.', 'UH.D.', 'UI.D.', 'UJ.D.', 'SH.D.', 'SA.D.', 'SB.D.', 'SC.D.', 'SD.D.', 'SE.D.', 'SF.D.', 'SG.D.', 'SI.D')) and epic.endswith('.DAILY.IP'):
             return price / 100
+            
         return price
