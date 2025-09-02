@@ -18,7 +18,7 @@ class FredService:
         self.cache = CacheService()
 
     # This is now a regular synchronous method
-    ddef get_series_data(self, series_id: str, series_name: str) -> Optional[Dict[str, Any]]:
+    def get_series_data(self, series_id: str, series_name: str) -> Optional[Dict[str, Any]]:
         cache_key = f"fred:{series_id}"
         cached_data = self.cache.get(cache_key)
         if cached_data:
